@@ -211,13 +211,49 @@ class FunctionalAnnotator:
 # --- Main Pipeline ---
 def main():
     processor = GWASProcessor(GWAS_FILE, QC_LIST_FILE)
-    leads_df = processor.get_significant_hits()
-    if leads_df.empty: return
-    clumps_df = LDEngine.clump_hits(leads_df)
-    print(f"Found {len(clumps_df)} independent loci.")
-    print(clumps_df[['CHROM', 'GENPOS', 'ID', 'LOG10P']].head(10))
     
-    selection = input("\nEnter locus index to test, 'all' for all, or 'q' to quit: ").strip().lower()
+    # 1. Identify Lead SNPs
+    leads_df = processor.get_significant_hits()
+    if leads_df.empty:
+        print("No significant hits found matching QC criteria.")
+        return
+        
+    # 2. Clump into independent loci
+    clumps_df = LDEngine.clump_hits(leads_df)
+    print(f"\nIdentified {len(clumps_df)} independent genomic loci.")
+    
+    # 3. Pre-calculate Credible Set sizes for informed selection
+    print("Calculating Credible Set sizes for each locus...")
+    cs_sizes = []
+    credible_sets = {} # Cache full sets to avoid re-calculating after selection
+    
+    for idx, row in tqdm(clumps_df.iterrows(), total=len(clumps_df), desc="Analyzing Loci"):
+        start, end = int(row['GENPOS'] - WINDOW_BP), int(row['GENPOS'] + WINDOW_BP)
+        region_df = processor.get_region_variants(row['CHROM'], start, end)
+        
+        if region_df.empty:
+            cs_sizes.append(0)
+            continue
+            
+        credible_set = FineMapper.define_credible_set(region_df)
+        cs_sizes.append(len(credible_set))
+        credible_sets[idx] = credible_set
+    
+    clumps_df['CS_Size'] = cs_sizes
+    
+    # Store sets in a way that aligns with the final DataFrame indices
+    valid_mask = clumps_df['CS_Size'] > 0
+    final_credible_sets = {i: credible_sets[old_idx] 
+                          for i, old_idx in enumerate(clumps_df.index[valid_mask])}
+    
+    clumps_df = clumps_df[valid_mask].reset_index(drop=True)
+
+    print("\nSummary of Identified Loci:")
+    print(clumps_df[['CHROM', 'GENPOS', 'ID', 'LOG10P', 'CS_Size']].head(20))
+    
+    # 4. User Selection
+    print(f"\nAlphaGenome annotation can be time-consuming (~1-2s per variant).")
+    selection = input("Enter locus index to analyze, 'all' for all, or 'q' to quit: ").strip().lower()
     
     if selection == 'q':
         return
@@ -225,37 +261,41 @@ def main():
         try:
             idx = int(selection)
             if 0 <= idx < len(clumps_df):
-                clumps_df = clumps_df.iloc[[idx]]
+                selected_indices = [idx]
             else:
-                 print("Invalid index. Analyzing top 1.")
-                 clumps_df = clumps_df.head(1)
-        except:
-            print("Invalid selection. Analyzing top 1.")
-            clumps_df = clumps_df.head(1)
+                 print(f"Invalid index. Please select between 0 and {len(clumps_df)-1}.")
+                 return
+        except ValueError:
+            print("Invalid input. Please enter a number, 'all', or 'q'.")
+            return
+    else:
+        selected_indices = clumps_df.index.tolist()
 
     annotator = FunctionalAnnotator()
     final_results = []
     
-    for idx, row in clumps_df.iterrows():
-        print(f"\n--- Analyzing Locus {row['ID']} ---")
-        start, end = int(row['GENPOS'] - WINDOW_BP), int(row['GENPOS'] + WINDOW_BP)
-        region_df = processor.get_region_variants(row['CHROM'], start, end)
-        if region_df.empty: continue
+    # 5. Execute AlphaGenome Annotation
+    for idx in selected_indices:
+        row = clumps_df.iloc[idx]
+        credible_set = final_credible_sets.get(idx)
         
-        credible_set = FineMapper.define_credible_set(region_df)
-        if credible_set.empty: continue
-        print(f"Credible Set size: {len(credible_set)} variants.")
-        
+        if credible_set is None or credible_set.empty:
+            continue
+            
+        print(f"\n--- Running AlphaGenome for Locus {row['ID']} ({len(credible_set)} variants) ---")
         scores = annotator.annotate_variants(credible_set)
-        filtered = annotator.filter_by_ontology(scores)
-        if not filtered.empty:
-            filtered['Locus_ID'] = row['ID']
-            final_results.append(filtered)
+        
+        # Filter by prioritized ontologies (Brain, Blood, T-Cells)
+        filtered_scores = annotator.filter_by_ontology(scores)
+        
+        if not filtered_scores.empty:
+            filtered_scores['Locus_ID'] = row['ID']
+            final_results.append(filtered_scores)
     
+    # 6. Final Export
     if final_results:
         final_df = pd.concat(final_results, ignore_index=True)
         final_df.to_csv(OUTPUT_FILE, index=False)
-        print(f"\nPipeline Complete. Saved to {OUTPUT_FILE}")
-
-if __name__ == "__main__":
-    main()
+        print(f"\nPipeline Complete. Multimodal results saved to {OUTPUT_FILE}")
+    else:
+        print("\nAnalysis produced no results after ontology filtering.")
