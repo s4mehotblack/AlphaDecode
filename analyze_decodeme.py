@@ -1,300 +1,261 @@
 import pandas as pd
 import numpy as np
 import os
+import subprocess
+import io
+from tqdm import tqdm
+from scipy.stats import norm
 
 # --- Configuration ---
 GWAS_FILE = 'DecodeME-SummaryStatistics/gwas_1.regenie'
 QC_LIST_FILE = 'DecodeME-SummaryStatistics/gwas_qced.var'
 OUTPUT_FILE = 'decodeme_alphagenome_results.csv'
-
-# API Key - loaded from environment variable
+LEADS_CACHE_FILE = 'decodeme_leads_cache.csv'
+CACHE_DIR = 'region_cache'
 API_KEY = os.environ.get('ALPHAGENOME_API_KEY')
 
-# Thresholds
-SIGNIFICANCE_THRESHOLD = 7.3  # approx 5e-8
-CLUMP_WINDOW_BP = 500_000     # +/- 500kb for distance-based clumping
+# Global Constants
+SIGNIFICANCE_THRESHOLD = 7.3  # LOG10P
+WINDOW_BP = 500_000 # +/- 500kb
+CREDIBLE_SET_THRESHOLD = 0.95
 
-# Mocking the AlphaGenome library import for demonstration purposes
-class MockAlphaGenome:
-    class genome:
-        class Interval:
-            def __init__(self, chrom, start, end, strand='+'):
-                pass
-            def resize(self, length):
-                return self
-        class Variant:
-            def __init__(self, chromosome, position, reference_bases, alternate_bases, name=None):
-                self.reference_interval = MockAlphaGenome.genome.Interval('1', 1, 1)
-    
-    class variant_scorers:
-        RECOMMENDED_VARIANT_SCORERS = {'RNA_SEQ': 'Mock_RNA_Scorer'}
-        @staticmethod
-        def tidy_scores(results):
-            return pd.DataFrame(results)
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-    class models:
-        class dna_client:
-            class Organism:
-                HOMO_SAPIENS = 'human'
-            @staticmethod
-            def create(api_key):
-                return MockAlphaGenome.DnaClient(api_key)
-
-    class DnaClient:
-        def __init__(self, api_key):
-            self.api_key = api_key
-        def score_variant(self, interval, variant, variant_scorers, organism):
-            return {
-                "variant_id": "mock_id",
-                "RNA_Seq_Score": np.random.rand()
-            }
-
-# Switch to real library if available
-client = None
+# --- AlphaGenome Setup ---
 try:
     import alphagenome as ag
     from alphagenome.models import dna_client, variant_scorers
     from alphagenome.data import genome
-    from tqdm import tqdm
-
-    if not API_KEY:
-        print("Warning: ALPHAGENOME_API_KEY environment variable not set.")
     
-    client = dna_client.create(api_key=API_KEY)
-    print("AlphaGenome client initialized successfully.")
-    ORGANISM = dna_client.Organism.HOMO_SAPIENS
-except (ImportError, AttributeError) as e:
-    print(f"AlphaGenome library initialization failed: {e}. Using Mock client.")
-    ag = MockAlphaGenome()
-    variant_scorers = ag.variant_scorers
-    genome = ag.genome
-    client = ag.models.dna_client.create(API_KEY)
-    ORGANISM = ag.models.dna_client.Organism.HOMO_SAPIENS
-    from tqdm import tqdm
-
-def load_and_filter_data():
-    """
-    Loads GWAS summary stats, filters by QC list and Significance.
-    Uses chunking to handle large files.
-    """
-    print(f"Loading QC list from {QC_LIST_FILE}...")
-    # Read QC variants into a Set for O(1) lookup
-    try:
-        # Optimizing QC load: only read ID column if possible, or just ID
-        qc_df = pd.read_csv(QC_LIST_FILE, header=0, usecols=['ID'])
-        valid_ids = set(qc_df['ID'])
-        del qc_df # Free memory
-    except Exception as e:
-        print(f"Error reading QC file: {e}")
-        return pd.DataFrame()
-
-    print(f"Loading and filtering GWAS stats from {GWAS_FILE}...")
-    
-    filtered_chunks = []
-    chunk_size = 100000
-    total_processed = 0
-    
-    # Read GWAS file in chunks
-    try:
-        # Explicitly specifying types for efficiency
-        dtype_spec = {
-            'CHROM': str, 
-            'GENPOS': int, 
-            'ID': str, 
-            'LOG10P': float
-        }
-        
-        reader = pd.read_csv(GWAS_FILE, sep=r'\s+', chunksize=chunk_size)
-        
-        for chunk in reader:
-            total_processed += len(chunk)
-            
-            # 1. Filter by Significance first (faster, numerical)
-            chunk = chunk[chunk['LOG10P'] >= SIGNIFICANCE_THRESHOLD]
-            
-            if not chunk.empty:
-                # 2. Filter by QC List (string lookup)
-                chunk = chunk[chunk['ID'].isin(valid_ids)]
-                
-                if not chunk.empty:
-                    filtered_chunks.append(chunk)
-            
-            if total_processed % 1_000_000 == 0:
-                print(f"Processed {total_processed} variants...")
-
-    except Exception as e:
-        print(f"Error reading GWAS file: {e}")
-        return pd.DataFrame()
-    
-    print(f"Total variants processed: {total_processed}")
-    
-    if filtered_chunks:
-        df = pd.concat(filtered_chunks, ignore_index=True)
-        print(f"Variants after all filters: {len(df)}")
-        return df
+    # Try to initialize client
+    if API_KEY:
+        AG_CLIENT = dna_client.create(api_key=API_KEY)
+        ORGANISM = dna_client.Organism.HOMO_SAPIENS
+        print("AlphaGenome Client initialized.")
     else:
-        return pd.DataFrame()
+        print("Warning: ALPHAGENOME_API_KEY not set.")
+        AG_CLIENT = None
+        ORGANISM = None
 
-def perform_clumping(df, window_bp=CLUMP_WINDOW_BP):
-    """
-    Performs greedy distance-based clumping.
-    """
-    if df.empty:
-        return df
+except ImportError:
+    print("AlphaGenome library not found. Functional Annotation will be skipped.")
+    ag = None
+    AG_CLIENT = None
 
-    print("Performing distance-based clumping...")
-    # Sort by Significance (descending)
-    df = df.sort_values(by='LOG10P', ascending=False)
-    
-    clumped_hits = []
-    
-    # Group by Chromosome first to avoid cross-chromosome calc
-    for chrom, group in df.groupby('CHROM'):
-        candidates = group.copy()
-        
-        while not candidates.empty:
-            # Take top hit
-            lead_snp = candidates.iloc[0]
-            clumped_hits.append(lead_snp)
-            
-            # Define window
-            pos = lead_snp['GENPOS']
-            start = pos - window_bp
-            end = pos + window_bp
-            
-            # Remove variants within window (including self)
-            candidates = candidates[
-                (candidates['GENPOS'] < start) | (candidates['GENPOS'] > end)
-            ]
-            
-    clumped_df = pd.DataFrame(clumped_hits).reset_index(drop=True)
-    print(f"Found {len(clumped_df)} independent loci.")
-    return clumped_df
+# --- Module 1: GWAS Processor ---
+class GWASProcessor:
+    def __init__(self, gwas_path, qc_path):
+        self.gwas_path = gwas_path
+        self.qc_path = qc_path
+        self.valid_ids = self._load_qc_list()
 
-def user_select_loci(df):
-    """
-    Displays loci and asks user for selection.
-    """
-    if df.empty:
-        return df
-
-    print("\nIdentified Loci (Top Hits):")
-    display_cols = ['CHROM', 'GENPOS', 'ID', 'LOG10P']
-    print(df[display_cols].to_string())
-    
-    while True:
-        choice = input("\nEnter locus index to test, 'all' for all, or 'q' to quit: ").strip().lower()
-        
-        if choice == 'q':
-            return pd.DataFrame()
-        elif choice == 'all':
-            return df
-        else:
-            try:
-                idx = int(choice)
-                if 0 <= idx < len(df):
-                    return df.iloc[[idx]]
-                else:
-                    print(f"Invalid index. Please enter a value between 0 and {len(df)-1}")
-            except ValueError:
-                print("Invalid input. Please enter an index, 'all', or 'q'.")
-
-def run_alphagenome_analysis(hits_df):
-    """
-    Queries AlphaGenome for each variant.
-    """
-    all_variant_results = []
-    # Supported length from error message: 1048576
-    SUPPORTED_SEQ_LENGTH = 1048576
-    
-    print(f"\nRunning AlphaGenome analysis on {len(hits_df)} selected loci...")
-    # Use tqdm for progress bar
-    for idx, row in tqdm(hits_df.iterrows(), total=len(hits_df)):
-        chrom = str(row['CHROM'])
-        # Prepend 'chr' if not already present
-        if not chrom.startswith('chr'):
-            chrom = f"chr{chrom}"
-            
-        pos = int(row['GENPOS'])
-        ref = row['ALLELE0']
-        alt = row['ALLELE1']
-        variant_id = row['ID']
-        
-        # 1. Define Variant using name and keyword arguments
-        variant = genome.Variant(
-            chromosome=chrom,
-            position=pos,
-            reference_bases=ref,
-            alternate_bases=alt,
-            name=variant_id
-        )
-        
-        # 2. Define Interval using resize on the variant's reference interval
-        interval = variant.reference_interval.resize(SUPPORTED_SEQ_LENGTH)
-        
-        # 3. Run score_variant
+    def _load_qc_list(self):
+        print(f"Loading QC list from {self.qc_path}...")
         try:
-            # Select scorers. Using RNA_SEQ as a default/example.
-            scorers = [variant_scorers.RECOMMENDED_VARIANT_SCORERS['RNA_SEQ']]
-            
-            variant_scores = client.score_variant(
-                interval=interval,
-                variant=variant,
-                variant_scorers=scorers,
-                organism=ORGANISM
-            )
-            
-            all_variant_results.append(variant_scores)
-            
+            qc_df = pd.read_csv(self.qc_path, header=0, usecols=['ID'])
+            return set(qc_df['ID'])
         except Exception as e:
-            print(f"Error processing {variant_id}: {e}")
+            print(f"Error loading QC list: {e}")
+            return set()
 
-    if not all_variant_results:
+    def get_significant_hits(self, threshold=SIGNIFICANCE_THRESHOLD):
+        """Pass 1: Identify genome-wide significant hits using fast AWK scan."""
+        if os.path.exists(LEADS_CACHE_FILE):
+            print(f"Loading significant hits from cache: {LEADS_CACHE_FILE}")
+            # Try reading as CSV, then as space-separated if that fails to find LOG10P
+            df = pd.read_csv(LEADS_CACHE_FILE)
+            if 'LOG10P' not in df.columns:
+                df = pd.read_csv(LEADS_CACHE_FILE, sep=r'\s+')
+            return df
+
+        print(f"Scanning for significant hits (LOG10P >= {threshold}) using awk...")
+        # LOG10P is column 16. Using awk for speed.
+        cmd = f"awk 'NR==1 || $16 >= {threshold}' {self.gwas_path}"
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                df = pd.read_csv(io.StringIO(result.stdout), sep=r'\s+')
+                # Apply QC filter if needed
+                if not df.empty and self.valid_ids:
+                    df = df[df['ID'].isin(self.valid_ids)]
+                
+                if not df.empty:
+                    df.to_csv(LEADS_CACHE_FILE, index=False)
+                    print(f"Found {len(df)} significant QC-passed hits.")
+                    return df
+            else:
+                print(f"Awk failed: {result.stderr}")
+        except Exception as e:
+            print(f"Error in awk scan: {e}")
+            
         return pd.DataFrame()
 
-    print("Tidying scores...")
-    try:
-        # Use tidy_scores as per forestglip.py
-        df_scores = variant_scorers.tidy_scores(all_variant_results)
+    def get_region_variants(self, chrom, start, end):
+        """Pass 2: Extract all variants in a window using fast AWK scan."""
+        region_cache_file = os.path.join(CACHE_DIR, f"region_{chrom}_{start}_{end}.csv")
+        if os.path.exists(region_cache_file):
+            print(f"Loading region from cache: {region_cache_file}")
+            return pd.read_csv(region_cache_file)
+
+        target_chrom = str(chrom).replace('chr', '')
+        print(f"Extracting region {target_chrom}:{start}-{end} using awk...")
         
-        # Merge back original GWAS info (LOG10P etc.) for context
-        # Extract ID from tidy results (assuming 'name' or 'variant_id' column exists)
-        # Check column names in tidy_scores output
-        # Based on typical tidy_scores, it should have variant-level columns
-        return df_scores
-    except Exception as e:
-        print(f"Error tidying scores: {e}")
+        # AWK to get header + matching rows
+        cmd = f"awk 'NR==1 || ($1 == \"{target_chrom}\" && $2 >= {start} && $2 <= {end})' {self.gwas_path}"
+        
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                df = pd.read_csv(io.StringIO(result.stdout), sep=r'\s+')
+                if not df.empty:
+                    # QC Filter
+                    if self.valid_ids:
+                        df = df[df['ID'].isin(self.valid_ids)]
+                    
+                    if not df.empty:
+                        df.to_csv(region_cache_file, index=False)
+                        return df
+            else:
+                print(f"Awk failed: {result.stderr}")
+        except Exception as e:
+            print(f"Error in awk region extraction: {e}")
+            
         return pd.DataFrame()
 
+# --- Module 2: LD Engine ---
+class LDEngine:
+    @staticmethod
+    def clump_hits(df, window=WINDOW_BP):
+        print("Performing distance-based clumping...")
+        if df.empty: return df
+        df = df.sort_values(by='LOG10P', ascending=False)
+        clumps = []
+        candidates = df.copy()
+        while not candidates.empty:
+            lead = candidates.iloc[0]
+            clumps.append(lead)
+            pos = lead['GENPOS']
+            chrom = lead['CHROM']
+            # Remove neighbors on same chrom within window
+            candidates = candidates[
+                (candidates['CHROM'] != chrom) | 
+                (candidates['GENPOS'] < pos - window) | 
+                (candidates['GENPOS'] > pos + window)
+            ]
+        return pd.DataFrame(clumps).reset_index(drop=True)
 
+# --- Module 3: Fine Mapper ---
+class FineMapper:
+    @staticmethod
+    def calculate_abf(beta, se, prior_variance=0.04):
+        z = beta / se
+        v = se**2
+        r = prior_variance / (prior_variance + v)
+        abf = np.sqrt(1 - r) * np.exp((z**2 / 2) * r)
+        return abf
+
+    @staticmethod
+    def define_credible_set(df_region):
+        if df_region.empty: return pd.DataFrame()
+        df = df_region.copy()
+        df['ABF'] = df.apply(lambda row: FineMapper.calculate_abf(row['BETA'], row['SE']), axis=1)
+        sum_abf = df['ABF'].sum()
+        df['PP'] = df['ABF'] / sum_abf
+        df = df.sort_values('PP', ascending=False)
+        df['CUM_PP'] = df['PP'].cumsum()
+        n_variants = len(df[df['CUM_PP'] < CREDIBLE_SET_THRESHOLD]) + 1
+        return df.head(n_variants)
+
+# --- Module 4: Functional Annotator ---
+class FunctionalAnnotator:
+    def __init__(self):
+        self.scorers = []
+        if ag and AG_CLIENT:
+            all_scorers = variant_scorers.RECOMMENDED_VARIANT_SCORERS
+            if 'RNA_SEQ' in all_scorers: self.scorers.append(all_scorers['RNA_SEQ'])
+            if 'ATAC_ACTIVE' in all_scorers: self.scorers.append(all_scorers['ATAC_ACTIVE'])
+            if 'SPLICE_JUNCTIONS' in all_scorers: self.scorers.append(all_scorers['SPLICE_JUNCTIONS'])
+
+    def annotate_variants(self, df):
+        if not AG_CLIENT or df.empty: return pd.DataFrame()
+        results = []
+        print(f"Annotating {len(df)} variants in Credible Set with AlphaGenome...")
+        for idx, row in tqdm(df.iterrows(), total=len(df)):
+            try:
+                chrom = f"chr{row['CHROM']}" if not str(row['CHROM']).startswith('chr') else str(row['CHROM'])
+                variant = genome.Variant(chromosome=chrom, position=int(row['GENPOS']),
+                                         reference_bases=row['ALLELE0'], alternate_bases=row['ALLELE1'],
+                                         name=row['ID'])
+                interval = variant.reference_interval.resize(1048576)
+                res = AG_CLIENT.score_variant(interval=interval, variant=variant,
+                                              variant_scorers=self.scorers, organism=ORGANISM)
+                results.append(res)
+            except Exception as e:
+                print(f"Error annotating {row['ID']}: {e}")
+        
+        if results:
+            try:
+                return variant_scorers.tidy_scores(results)
+            except Exception as e:
+                print(f"Error tidying scores: {e}")
+        return pd.DataFrame()
+
+    def filter_by_ontology(self, df_scores):
+        if df_scores.empty: return df_scores
+        target_ontologies = ['UBERON:0000955', 'UBERON:0000178', 'CL:0000084']
+        if 'ontology_curie' in df_scores.columns:
+            return df_scores[df_scores['ontology_curie'].isin(target_ontologies)]
+        return df_scores
+
+# --- Main Pipeline ---
 def main():
-    # A. Data Prep & QC
-    df_sig = load_and_filter_data()
+    processor = GWASProcessor(GWAS_FILE, QC_LIST_FILE)
+    leads_df = processor.get_significant_hits()
+    if leads_df.empty: return
+    clumps_df = LDEngine.clump_hits(leads_df)
+    print(f"Found {len(clumps_df)} independent loci.")
+    print(clumps_df[['CHROM', 'GENPOS', 'ID', 'LOG10P']].head(10))
     
-    if df_sig.empty:
-        print("No significant variants found matching QC criteria.")
+    selection = input("\nEnter locus index to test, 'all' for all, or 'q' to quit: ").strip().lower()
+    
+    if selection == 'q':
         return
+    elif selection != 'all':
+        try:
+            idx = int(selection)
+            if 0 <= idx < len(clumps_df):
+                clumps_df = clumps_df.iloc[[idx]]
+            else:
+                 print("Invalid index. Analyzing top 1.")
+                 clumps_df = clumps_df.head(1)
+        except:
+            print("Invalid selection. Analyzing top 1.")
+            clumps_df = clumps_df.head(1)
 
-    # B. Clumping (Optimization)
-    df_clumped = perform_clumping(df_sig)
+    annotator = FunctionalAnnotator()
+    final_results = []
     
-    # D. User Selection (New)
-    df_selected = user_select_loci(df_clumped)
+    for idx, row in clumps_df.iterrows():
+        print(f"\n--- Analyzing Locus {row['ID']} ---")
+        start, end = int(row['GENPOS'] - WINDOW_BP), int(row['GENPOS'] + WINDOW_BP)
+        region_df = processor.get_region_variants(row['CHROM'], start, end)
+        if region_df.empty: continue
+        
+        credible_set = FineMapper.define_credible_set(region_df)
+        if credible_set.empty: continue
+        print(f"Credible Set size: {len(credible_set)} variants.")
+        
+        scores = annotator.annotate_variants(credible_set)
+        filtered = annotator.filter_by_ontology(scores)
+        if not filtered.empty:
+            filtered['Locus_ID'] = row['ID']
+            final_results.append(filtered)
     
-    if df_selected.empty:
-        print("No loci selected. Exiting.")
-        return
-
-    # C. AlphaGenome Implementation
-    results_df = run_alphagenome_analysis(df_selected)
-    
-    # Save Results
-    if not results_df.empty:
-        results_df.to_csv(OUTPUT_FILE, index=False)
-        print(f"\nAnalysis complete. Results saved to {OUTPUT_FILE}")
-        print(results_df.head())
-    else:
-        print("\nAnalysis produced no results.")
+    if final_results:
+        final_df = pd.concat(final_results, ignore_index=True)
+        final_df.to_csv(OUTPUT_FILE, index=False)
+        print(f"\nPipeline Complete. Saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
