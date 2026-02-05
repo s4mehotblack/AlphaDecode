@@ -208,20 +208,42 @@ class FunctionalAnnotator:
             return df_scores[df_scores['ontology_curie'].isin(target_ontologies)]
         return df_scores
 
+def get_final_filename(base_name):
+    """Handles filename collisions by prompting for overwrite or timestamp."""
+    filename = f"{base_name}.csv"
+    if os.path.exists(filename):
+        print(f"\nWarning: File '{filename}' already exists.")
+        choice = input("Enter '1' to add timestamp, '2' to overwrite, or 'q' to quit: ").strip().lower()
+        if choice == '1':
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"{base_name}_{timestamp}.csv"
+        elif choice == '2':
+            print(f"Overwriting {filename}...")
+        else:
+            print("Exiting.")
+            sys.exit(0)
+    return filename
+
 # --- Main Pipeline ---
 def main():
+    print("Starting pipeline...")
     processor = GWASProcessor(GWAS_FILE, QC_LIST_FILE)
     
     # 1. Identify Lead SNPs
     leads_df = processor.get_significant_hits()
+    print(f"Leads loaded: {len(leads_df)} rows.")
     if leads_df.empty:
-        print("No significant hits found matching QC criteria.")
+        print("No significant hits found matching QC criteria. Exiting.")
         return
         
     # 2. Clump into independent loci
     clumps_df = LDEngine.clump_hits(leads_df)
     print(f"\nIdentified {len(clumps_df)} independent genomic loci.")
     
+    if clumps_df.empty:
+        print("Clumping resulted in 0 loci. Exiting.")
+        return
+
     # 3. Pre-calculate Credible Set sizes for informed selection
     print("Calculating Credible Set sizes for each locus...")
     cs_sizes = []
@@ -239,14 +261,22 @@ def main():
         cs_sizes.append(len(credible_set))
         credible_sets[idx] = credible_set
     
+    print(f"Credible sets calculated. Non-zero counts: {sum(1 for s in cs_sizes if s > 0)}")
+    
     clumps_df['CS_Size'] = cs_sizes
     
     # Store sets in a way that aligns with the final DataFrame indices
     valid_mask = clumps_df['CS_Size'] > 0
+    
+    if not valid_mask.any():
+        print("No loci with >0 credible variants found. Exiting.")
+        return
+
     final_credible_sets = {i: credible_sets[old_idx] 
                           for i, old_idx in enumerate(clumps_df.index[valid_mask])}
     
     clumps_df = clumps_df[valid_mask].reset_index(drop=True)
+    print(f"Final loci count after filtering empty sets: {len(clumps_df)}")
 
     print("\nSummary of Identified Loci:")
     print(clumps_df[['CHROM', 'GENPOS', 'ID', 'LOG10P', 'CS_Size']].head(20))
@@ -262,6 +292,7 @@ def main():
             idx = int(selection)
             if 0 <= idx < len(clumps_df):
                 selected_indices = [idx]
+                output_base = f"decodeme_locus_{idx}"
             else:
                  print(f"Invalid index. Please select between 0 and {len(clumps_df)-1}.")
                  return
@@ -270,6 +301,10 @@ def main():
             return
     else:
         selected_indices = clumps_df.index.tolist()
+        output_base = "decodeme_all_loci"
+
+    # Resolve filename with collision check
+    output_filename = get_final_filename(output_base)
 
     annotator = FunctionalAnnotator()
     final_results = []
@@ -289,13 +324,18 @@ def main():
         filtered_scores = annotator.filter_by_ontology(scores)
         
         if not filtered_scores.empty:
-            filtered_scores['Locus_ID'] = row['ID']
+            # Create a copy to avoid SettingWithCopyWarning and add Locus_ID
+            filtered_scores = filtered_scores.copy()
+            filtered_scores.loc[:, 'Locus_ID'] = row['ID']
             final_results.append(filtered_scores)
     
     # 6. Final Export
     if final_results:
         final_df = pd.concat(final_results, ignore_index=True)
-        final_df.to_csv(OUTPUT_FILE, index=False)
-        print(f"\nPipeline Complete. Multimodal results saved to {OUTPUT_FILE}")
+        final_df.to_csv(output_filename, index=False)
+        print(f"\nPipeline Complete. Multimodal results saved to {output_filename}")
     else:
         print("\nAnalysis produced no results after ontology filtering.")
+
+if __name__ == "__main__":
+    main()
