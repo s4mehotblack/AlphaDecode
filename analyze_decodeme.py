@@ -7,6 +7,7 @@ import requests
 import time
 import sys
 import argparse
+import hashlib
 from tqdm import tqdm
 from scipy.stats import norm
 from pathlib import Path
@@ -21,6 +22,7 @@ DEFAULT_FALLBACK_WINDOW_BP = 50_000 # +/- 50kb
 DEFAULT_CREDIBLE_THRESHOLD = 0.95
 DEFAULT_CACHE_DIR = 'region_cache'
 DEFAULT_LD_CACHE_DIR = 'ld_cache'
+DEFAULT_RESULTS_CACHE_DIR = 'results_cache'
 
 # --- LDLink Client ---
 class LDLinkClient:
@@ -31,7 +33,6 @@ class LDLinkClient:
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def get_proxies(self, chrom, pos, pop="EUR", r2_threshold=0.1):
-        """Fetches proxies for a variant using GRCh38 coordinates. Checks cache first."""
         chrom_clean = str(chrom).replace('chr', '')
         cache_filename = os.path.join(self.cache_dir, f"proxies_chr{chrom_clean}_{pos}_{pop}.csv")
         
@@ -178,6 +179,7 @@ class LDEngine:
 
     @staticmethod
     def get_ld_data_with_fallback(ld_client, chrom, lead_pos, region_df, neighbor_radius_bp=10000, max_neighbors=5):
+        if not ld_client: return pd.DataFrame(), "LD Disabled"
         proxies = ld_client.get_proxies(chrom, lead_pos)
         if not proxies.empty: return proxies, "Lead SNP"
         if not region_df.empty:
@@ -211,10 +213,13 @@ class FineMapper:
 
 # --- Module 4: Functional Annotator ---
 class FunctionalAnnotator:
-    def __init__(self, api_key):
+    def __init__(self, api_key, cache_dir):
         self.client = None
         self.organism = None
         self.scorers = []
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
         if not api_key: return
         if ag:
             try:
@@ -229,19 +234,41 @@ class FunctionalAnnotator:
 
     def annotate_variants(self, df):
         if not self.client or df.empty: return pd.DataFrame()
-        results = []
-        print(f"Annotating {len(df)} variants...")
-        for idx, row in tqdm(df.iterrows(), total=len(df)):
+        
+        # Scorer hash for unique cache key
+        scorer_ids = sorted([str(s) for s in self.scorers])
+        scorer_hash = hashlib.md5("".join(scorer_ids).encode()).hexdigest()[:8]
+        
+        aggregated_results = []
+        print(f"Processing {len(df)} variants (using cache if available)...")
+        
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="VEP"):
+            var_id_clean = row['ID'].replace(':', '_')
+            cache_file = os.path.join(self.cache_dir, f"vep_{var_id_clean}_{scorer_hash}.csv")
+            
+            if os.path.exists(cache_file):
+                var_df = pd.read_csv(cache_file)
+                aggregated_results.append(var_df)
+                continue
+                
             try:
                 chrom = f"chr{row['CHROM']}" if not str(row['CHROM']).startswith('chr') else str(row['CHROM'])
-                variant = genome.Variant(chromosome=chrom, position=int(row['GENPOS']), reference_bases=row['ALLELE0'], alternate_bases=row['ALLELE1'], name=row['ID'])
+                variant = genome.Variant(chromosome=chrom, position=int(row['GENPOS']), 
+                                         reference_bases=row['ALLELE0'], alternate_bases=row['ALLELE1'], 
+                                         name=row['ID'])
                 interval = variant.reference_interval.resize(1048576)
-                res = self.client.score_variant(interval=interval, variant=variant, variant_scorers=self.scorers, organism=self.organism)
-                results.append(res)
-            except Exception as e: print(f"Error annotating {row['ID']}: {e}")
-        if results:
-            try: return variant_scorers.tidy_scores(results)
-            except Exception as e: print(f"Error tidying scores: {e}")
+                res = self.client.score_variant(interval=interval, variant=variant, 
+                                              variant_scorers=self.scorers, organism=self.organism)
+                
+                if res:
+                    var_df = variant_scorers.tidy_scores(res)
+                    var_df.to_csv(cache_file, index=False)
+                    aggregated_results.append(var_df)
+            except Exception as e:
+                print(f"Error annotating {row['ID']}: {e}")
+        
+        if aggregated_results:
+            return pd.concat(aggregated_results, ignore_index=True)
         return pd.DataFrame()
 
     def filter_by_ontology(self, df_scores):
@@ -265,11 +292,13 @@ def main():
     parser = argparse.ArgumentParser(description="DecodeME AlphaGenome Analysis Pipeline", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--gwas", default=DEFAULT_GWAS_FILE); parser.add_argument("--qc", default=DEFAULT_QC_FILE)
     parser.add_argument("--output", default=DEFAULT_OUTPUT_BASE); parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--ld-cache-dir", default=DEFAULT_LD_CACHE_DIR); parser.add_argument("--sig-threshold", type=float, default=DEFAULT_SIG_THRESHOLD)
+    parser.add_argument("--ld-cache-dir", default=DEFAULT_LD_CACHE_DIR); parser.add_argument("--results-cache-dir", default=DEFAULT_RESULTS_CACHE_DIR)
+    parser.add_argument("--sig-threshold", type=float, default=DEFAULT_SIG_THRESHOLD)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_BP); parser.add_argument("--fallback-window", type=int, default=DEFAULT_FALLBACK_WINDOW_BP)
     parser.add_argument("--credible-set", type=float, default=DEFAULT_CREDIBLE_THRESHOLD); parser.add_argument("--chrom")
     parser.add_argument("--start", type=int); parser.add_argument("--end", type=int); parser.add_argument("--no-ldlink", action="store_true")
     parser.add_argument("--skip-qc", action="store_true"); parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--full-results", action="store_true", help="Save all tissue tracks without ontology filtering")
     args = parser.parse_args()
 
     ag_key, ld_token = os.environ.get('ALPHAGENOME_API_KEY'), os.environ.get('LDLINK_API_TOKEN')
@@ -329,13 +358,19 @@ def main():
             except ValueError: return
 
     output_filename = get_final_filename(output_base, args.non_interactive)
-    annotator, final_results = FunctionalAnnotator(ag_key), []
+    annotator, final_results = FunctionalAnnotator(ag_key, args.results_cache_dir), []
     for idx in selected_indices:
         row, cs = clumps_df.iloc[idx], final_credible_sets.get(idx)
         if cs is None or cs.empty: continue
         print(f"\n--- Running AlphaGenome for Locus {row['ID']} ({len(cs)} variants) ---")
         scores = annotator.annotate_variants(cs)
-        filtered = annotator.filter_by_ontology(scores)
+        
+        # Apply filtering unless --full-results is set
+        if args.full_results:
+            filtered = scores
+        else:
+            filtered = annotator.filter_by_ontology(scores)
+            
         if not filtered.empty:
             filtered = filtered.copy(); filtered.loc[:, 'Locus_ID'] = row['ID']; final_results.append(filtered)
     
