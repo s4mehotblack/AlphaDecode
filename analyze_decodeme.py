@@ -255,84 +255,42 @@ class LDEngine:
         matched = merged[merged['GWAS_ALLELES'] == merged['LD_ALLELES']].copy()
         return matched
 
+    @staticmethod
+    def get_ld_data_with_fallback(ld_client, chrom, lead_pos, region_df, neighbor_radius_bp=10000, max_neighbors=5):
+        """
+        Tries to get LD data for lead SNP. If fails (e.g. missing in 1000G), 
+        tries nearby significant neighbors as proxies.
+        Returns: (proxies_df, strategy_description)
+        """
+        # Attempt 1: Lead SNP
+        proxies = ld_client.get_proxies(chrom, lead_pos)
+        if not proxies.empty:
+            return proxies, "Lead SNP"
+
+        # Attempt 2: Neighbor Proxy
+        if not region_df.empty:
+            mask = (region_df['GENPOS'] >= lead_pos - neighbor_radius_bp) & \
+                   (region_df['GENPOS'] <= lead_pos + neighbor_radius_bp) & \
+                   (region_df['GENPOS'] != lead_pos)
+            
+            neighbors = region_df[mask].sort_values(by='LOG10P', ascending=False).head(max_neighbors)
+            
+            for _, row in neighbors.iterrows():
+                print(f"  > Lead missing/failed. Trying neighbor {row['ID']} (P={row['LOG10P']:.2f})...")
+                proxies = ld_client.get_proxies(row['CHROM'], row['GENPOS'])
+                if not proxies.empty:
+                    return proxies, f"Neighbor Proxy ({row['ID']})"
+
+        # Attempt 3: Fallback
+        return pd.DataFrame(), "Physical Window (Distance Fallback)"
+
 # --- Module 3: Fine Mapper ---
 class FineMapper:
-    @staticmethod
-    def calculate_abf(beta, se, prior_variance=0.04):
-        z = beta / se
-        v = se**2
-        r = prior_variance / (prior_variance + v)
-        abf = np.sqrt(1 - r) * np.exp((z**2 / 2) * r)
-        return abf
-
-    @staticmethod
-    def define_credible_set(df_region):
-        if df_region.empty: return pd.DataFrame()
-        df = df_region.copy()
-        df['ABF'] = df.apply(lambda row: FineMapper.calculate_abf(row['BETA'], row['SE']), axis=1)
-        sum_abf = df['ABF'].sum()
-        df['PP'] = df['ABF'] / sum_abf
-        df = df.sort_values('PP', ascending=False)
-        df['CUM_PP'] = df['PP'].cumsum()
-        n_variants = len(df[df['CUM_PP'] < CREDIBLE_SET_THRESHOLD]) + 1
-        return df.head(n_variants)
-
-# --- Module 4: Functional Annotator ---
-class FunctionalAnnotator:
-    def __init__(self):
-        self.scorers = []
-        if ag and AG_CLIENT:
-            all_scorers = variant_scorers.RECOMMENDED_VARIANT_SCORERS
-            if 'RNA_SEQ' in all_scorers: self.scorers.append(all_scorers['RNA_SEQ'])
-            if 'ATAC_ACTIVE' in all_scorers: self.scorers.append(all_scorers['ATAC_ACTIVE'])
-            if 'SPLICE_JUNCTIONS' in all_scorers: self.scorers.append(all_scorers['SPLICE_JUNCTIONS'])
-
-    def annotate_variants(self, df):
-        if not AG_CLIENT or df.empty: return pd.DataFrame()
-        results = []
-        print(f"Annotating {len(df)} variants in Credible Set with AlphaGenome...")
-        for idx, row in tqdm(df.iterrows(), total=len(df)):
-            try:
-                chrom = f"chr{row['CHROM']}" if not str(row['CHROM']).startswith('chr') else str(row['CHROM'])
-                variant = genome.Variant(chromosome=chrom, position=int(row['GENPOS']),
-                                         reference_bases=row['ALLELE0'], alternate_bases=row['ALLELE1'],
-                                         name=row['ID'])
-                interval = variant.reference_interval.resize(1048576)
-                res = AG_CLIENT.score_variant(interval=interval, variant=variant,
-                                              variant_scorers=self.scorers, organism=ORGANISM)
-                results.append(res)
-            except Exception as e:
-                print(f"Error annotating {row['ID']}: {e}")
-        
-        if results:
-            try: return variant_scorers.tidy_scores(results)
-            except Exception as e: print(f"Error tidying scores: {e}")
-        return pd.DataFrame()
-
-    def filter_by_ontology(self, df_scores):
-        if df_scores.empty: return df_scores
-        target_ontologies = ['UBERON:0000955', 'UBERON:0000178', 'CL:0000084']
-        if 'ontology_curie' in df_scores.columns:
-            return df_scores[df_scores['ontology_curie'].isin(target_ontologies)]
-        return df_scores
-
-def get_final_filename(base_name):
-    filename = f"{base_name}.csv"
-    if os.path.exists(filename):
-        print(f"\nWarning: File '{filename}' already exists.")
-        choice = input("Enter '1' to add timestamp, '2' to overwrite, or 'q' to quit: ").strip().lower()
-        if choice == '1':
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"{base_name}_{timestamp}.csv"
-        elif choice == '2':
-            print(f"Overwriting {filename}...")
-        else:
-            print("Exiting.")
-            sys.exit(0)
-    return filename
+# ... (rest of file) ...
 
 # --- Main Pipeline ---
 def main():
+    # ... (arg parsing and setup) ...
     parser = argparse.ArgumentParser(description="DecodeME AlphaGenome Analysis Pipeline")
     parser.add_argument("--chrom", help="Filter by Chromosome (e.g., 1)")
     parser.add_argument("--start", type=int, help="Filter start position (bp)")
@@ -362,21 +320,23 @@ def main():
         
         fine_mapping_input = region_df
         if ld_client:
-            proxies = ld_client.get_proxies(row['CHROM'], row['GENPOS'])
+            proxies, strategy = LDEngine.get_ld_data_with_fallback(ld_client, row['CHROM'], row['GENPOS'], region_df)
+            
             if not proxies.empty:
                 ld_filtered = LDEngine.merge_gwas_with_ld(region_df, proxies)
                 if not ld_filtered.empty:
                     fine_mapping_input = ld_filtered
                 else:
-                    print(f"  Warning: LD filtering for {row['ID']} resulted in 0 variants (Allele mismatch?). Falling back to physical window.")
+                    print(f"  Warning: LD filtering for {row['ID']} resulted in 0 variants (Allele mismatch?). Strategy: {strategy}. Falling back to physical window.")
             else:
-                print(f"  Warning: No LD data for {row['ID']}. Falling back to physical window.")
+                print(f"  Warning: No LD data for {row['ID']} after fallback attempts. Strategy: {strategy}.")
 
         credible_set = FineMapper.define_credible_set(fine_mapping_input)
         cs_sizes.append(len(credible_set))
         credible_sets[idx] = credible_set
     
     clumps_df['CS_Size'] = cs_sizes
+# ... (rest of main) ...
     valid_mask = clumps_df['CS_Size'] > 0
     if not valid_mask.any():
         print("No loci with >0 credible variants found. Exiting."); return
