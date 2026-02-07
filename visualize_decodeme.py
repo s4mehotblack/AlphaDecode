@@ -90,20 +90,21 @@ def get_locus_leads_map(file_path):
     except Exception: return pd.DataFrame()
 
 @st.cache_data
-def get_snps_by_chrom_lazy(file_path, chrom):
+def get_snps_with_meta_lazy(file_path, chrom):
     if HAS_POLARS:
         try:
             lf = pl.scan_csv(file_path)
             schema = lf.collect_schema().names()
             if "variant_id" in schema:
                 if "CHROM" in schema:
-                    q = lf.filter(pl.col("CHROM").astype(pl.Utf8) == str(chrom)).select("variant_id").unique()
+                    q = lf.filter(pl.col("CHROM").astype(pl.Utf8) == str(chrom))
                 else:
-                    q = lf.filter(pl.col("variant_id").str.starts_with(f"{chrom}:") | pl.col("variant_id").str.starts_with(f"chr{chrom}:")).select("variant_id").unique()
-                vals = q.collect(engine="streaming").to_series().to_list()
-                return sorted([str(x) for x in vals if x is not None])
+                    q = lf.filter(pl.col("variant_id").str.starts_with(f"{chrom}:") | 
+                                  pl.col("variant_id").str.starts_with(f"chr{chrom}:"))
+                q = q.group_by("variant_id").agg(pl.col("quantile_score").abs().max().alias("max_impact"))
+                return q.sort("max_impact", descending=True).collect(engine="streaming").to_pandas()
         except Exception: pass
-    return []
+    return pd.DataFrame(columns=['variant_id', 'max_impact'])
 
 @st.cache_data
 def load_filtered_subset(file_path, locus_id, score_thresh, genes=None, biosamples=None, assays=None, ignore_thresh_for_assays=False):
@@ -153,6 +154,19 @@ def assign_biological_system(biosample_name):
     if any(x in name for x in ['kidney', 'renal', 'bladder']): return "Renal"
     return "Other"
 
+def format_pval(log10p):
+    try:
+        if pd.isna(log10p): return "N/A"
+        val = 10**(-float(log10p))
+        return f"{val:.2e}"
+    except (ValueError, TypeError): return "N/A"
+
+def normalize_id_for_join(id_str):
+    if not isinstance(id_str, str): return id_str
+    s = id_str.lower().replace('chr', '')
+    s = s.replace('>', ':')
+    return s.strip()
+
 # --- Main App ---
 
 st.title("🧬 DecodeME Functional Workbench")
@@ -160,7 +174,7 @@ st.title("🧬 DecodeME Functional Workbench")
 with st.sidebar:
     st.header("Data Source")
     files = get_available_files()
-    if not files: st.error("No CSV files found."); st.stop()
+    if not files: st.error("No CSV found."); st.stop()
     selected_file = st.selectbox("Select Results File", files)
     if st.button("Refresh Files"): get_available_files.clear(); st.rerun()
     st.divider(); st.header("Primary Filters")
@@ -183,52 +197,64 @@ with st.sidebar:
 with st.spinner(f"Filtering records..."):
     filtered_df = load_filtered_subset(selected_file, selected_locus, score_threshold, genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
 
+# --- Actionable Intelligence Hub ---
 if not filtered_df.empty and selected_locus != 'All':
-    st.markdown("### 📍 Locus Overview")
+    st.markdown("### 📍 Locus Context & Candidate Selection")
+    lead_p, lead_id = "N/A", "N/A"
     if not leads_df.empty and 'ID' in leads_df.columns:
         locus_gwas = leads_df[leads_df['ID'] == selected_locus]
-        if not locus_gwas.empty and 'LOG10P' in locus_gwas.columns:
-            st.info(f"**GWAS Lead Signal:** P = 10^-{locus_gwas['LOG10P'].iloc[0]:.1f}")
-    st.markdown("**Top Functional Candidates (Ranked by Impact):**")
-    top_hits = filtered_df.sort_values('quantile_score', key=abs, ascending=False).head(10)
-    display_cols = ['variant_id', 'biosample_name', 'output_type', 'quantile_score']
-    cols_to_show = [c for c in display_cols if c in top_hits.columns]
-    top_hits_display = top_hits[cols_to_show].copy()
-    if 'variant_id' in top_hits_display.columns:
-        top_hits_display['Variant'] = top_hits_display['variant_id'].apply(format_variant_label)
-        top_hits_display = top_hits_display[['Variant'] + [c for c in cols_to_show if c != 'variant_id']]
-    # Fix: width='stretch' instead of use_container_width
-    st.dataframe(top_hits_display, width='stretch', hide_index=True)
+        if not locus_gwas.empty:
+            lead_p, lead_id = format_pval(locus_gwas['LOG10P'].iloc[0]), locus_gwas['ID'].iloc[0]
+
+    top_row = filtered_df.loc[filtered_df['quantile_score'].abs().idxmax()]
+    c_stat, c_func = st.columns(2)
+    with c_stat: st.info(f"**Statistical Context (GWAS)**\n\n**Lead SNP:** {lead_id}\n\n**P-value:** {lead_p}")
+    with c_func: st.success(f"**Functional Evidence (AlphaGenome)**\n\n**Top Variant:** {top_row['variant_id'].split(':')[-1]}\n\n**Max Impact:** {top_row['quantile_score']:.2f} ({top_row['biosample_name']})")
+
+    st.markdown("**Interactive Candidate Table:** Select a row to sync with the Deep Dive.")
+    top_hits = filtered_df.sort_values('quantile_score', key=abs, ascending=False).head(15).copy()
+    
+    if not leads_df.empty:
+        top_hits['join_key'] = top_hits['variant_id'].apply(normalize_id_for_join)
+        leads_copy = leads_df[['ID', 'LOG10P']].copy()
+        leads_copy['join_key'] = leads_copy['ID'].apply(normalize_id_for_join)
+        enriched = pd.merge(top_hits, leads_copy[['join_key', 'LOG10P']], on='join_key', how='left')
+        enriched['GWAS P'] = enriched['LOG10P'].apply(format_pval)
+        cols_to_show = ['variant_id', 'GWAS P', 'biosample_name', 'output_type', 'quantile_score']
+    else:
+        enriched = top_hits
+        cols_to_show = ['variant_id', 'biosample_name', 'output_type', 'quantile_score']
+
+    display_df = enriched[cols_to_show].copy()
+    display_df['Variant'] = display_df['variant_id'].apply(format_variant_label)
+    display_df = display_df[['Variant'] + [c for c in cols_to_show if c != 'variant_id']]
+
+    selection = st.dataframe(display_df, width='stretch', hide_index=True, on_select="rerun", selection_mode="single-row")
+    if selection.selection.rows:
+        sel_vid = enriched.iloc[selection.selection.rows[0]]['variant_id']
+        st.session_state['sel_var_portal'] = sel_vid; st.toast(f"Synchronized with {sel_vid}")
     st.divider()
 
+# --- Module 1: Macro-Visualization ---
 st.subheader("1. Macro-View: Functional Landscape")
 tab1, tab2, tab3 = st.tabs(["🔥 Functional Fingerprint", "🔗 Mechanism", "🔎 Quick Lookup"])
 
 with tab1:
-    h_thresh = st.slider("Heatmap-specific Score Threshold", 0.0, 1.0, score_threshold, 0.05, key="h_thresh")
+    h_thresh = st.slider("Heatmap Score Threshold", 0.0, 1.0, score_threshold, 0.05, key="h_t")
     h_df = filtered_df[filtered_df['quantile_score'].abs() >= h_thresh].copy()
     if not h_df.empty and 'biosample_name' in h_df.columns:
         h_df['System'] = h_df['biosample_name'].apply(assign_biological_system)
         available_systems = sorted(h_df['System'].unique())
         c1, c2 = st.columns([2, 1])
-        selected_system = c1.selectbox("Select Biological System", available_systems)
-        # Fix: Axis orientation toggle to prevent squashing
-        orient = c2.radio("Axis Layout", ["Variant focus", "Tissue focus"], horizontal=True)
+        selected_system = c1.selectbox("System", available_systems)
+        orient = c2.radio("Axis", ["Variant focus", "Tissue focus"], horizontal=True)
         sys_df = h_df[h_df['System'] == selected_system]
         heatmap_data = sys_df.groupby(['variant_id', 'biosample_name'])['quantile_score'].mean().reset_index()
         heatmap_data['display_id'] = heatmap_data['variant_id'].apply(lambda x: x.split(':')[-1])
-        
-        # Swapping axes based on toggle
         x_col, y_col = ("biosample_name", "display_id") if orient == "Variant focus" else ("display_id", "biosample_name")
-        plot_height = max(400, min(1500, len(heatmap_data[y_col].unique()) * 25))
-        
-        fig = px.density_heatmap(heatmap_data, x=x_col, y=y_col, z="quantile_score",
-                                 color_continuous_scale="RdBu_r", range_color=[-1, 1],
-                                 title=f"Impact Heatmap: {selected_system}",
-                                 labels={'quantile_score': 'Impact'})
-        fig.update_layout(height=plot_height)
+        fig = px.density_heatmap(heatmap_data, x=x_col, y=y_col, z="quantile_score", color_continuous_scale="RdBu_r", range_color=[-1, 1], title=f"Impact: {selected_system}")
+        fig.update_layout(height=max(400, min(1200, len(heatmap_data[y_col].unique()) * 25)))
         st.plotly_chart(fig, width="stretch")
-    else: st.info("No data for Heatmap.")
 
 with tab2:
     incl_sub = st.checkbox("Include sub-threshold scores", value=True)
@@ -238,36 +264,32 @@ with tab2:
         assays_f = [c for c in pivot_df.columns if c not in ['variant_id', 'biosample_name']]
         if len(assays_f) >= 2:
             c1, c2 = st.columns(2)
-            x_ax, y_ax = c1.selectbox("X-Axis", assays_f, index=0), c2.selectbox("Y-Axis", assays_f, index=1)
-            fig = px.scatter(pivot_df, x=x_ax, y=y_ax, color="biosample_name", hover_data=['variant_id'], title="Modality Cross-Correlation")
+            x_ax, y_ax = c1.selectbox("X", assays_f, index=0), c2.selectbox("Y", assays_f, index=min(1, len(assays_f)-1))
+            fig = px.scatter(pivot_df, x=x_ax, y=y_ax, color="biosample_name", hover_data=['variant_id'], title="Cross-Modality")
             fig.add_hline(y=0, line_dash="dash", line_color="grey"); fig.add_vline(x=0, line_dash="dash", line_color="grey")
             st.plotly_chart(fig, width="stretch")
-    else: st.info("No data for correlation.")
 
 with tab3:
     st.markdown("### 🔎 Quick Lookup Portal")
     col_c, col_s = st.columns([1, 3])
     with col_c: selected_chrom = st.selectbox("Chromosome", all_chroms)
     with col_s:
-        is_manual = st.checkbox("Manual Variant Entry")
-        if is_manual: lookup_vid = st.text_input("Enter Variant ID (e.g. chr1:123:A:C)", "")
+        is_manual = st.checkbox("Manual Entry")
+        if is_manual: lookup_vid = st.text_input("Variant ID", "")
         else:
-            with st.spinner(f"Loading SNPs for Chr {selected_chrom}..."): snps_in_chrom = get_snps_by_chrom_lazy(selected_file, selected_chrom)
-            lookup_vid = st.selectbox("Search SNPs in Results", snps_in_chrom)
+            with st.spinner("Indexing SNPs..."): snp_meta = get_snps_with_meta_lazy(selected_file, selected_chrom)
+            snp_labels = [f"{row['variant_id'].split(':')[-1]} (Impact: {row['max_impact']:.2f})" for _, row in snp_meta.iterrows()]
+            label_to_id = dict(zip(snp_labels, snp_meta['variant_id']))
+            sel_label = st.selectbox("Search SNPs (Sorted by Impact)", snp_labels)
+            lookup_vid = label_to_id.get(sel_label)
     if lookup_vid:
         st.divider()
         snp_df = get_variant_context(selected_file, lookup_vid)
-        if not snp_df.empty:
-            max_row = snp_df.loc[snp_df['quantile_score'].abs().idxmax()]
-            st.metric("Max Impact", f"{max_row['quantile_score']:.2f}")
-            st.caption(f"In {max_row['biosample_name']}")
-            suggested = snp_df.sort_values('quantile_score', ascending=False)['biosample_name'].unique().tolist()[:5]
-        else: suggested = []
-        st.markdown("#### 🎯 Smart Tissue Selection")
-        sel_portal_tissues = st.multiselect("Select Tissues for Deep Dive", biosamples, default=safe_defaults(suggested, biosamples))
-        if st.button("🧬 Send to Molecular Deep Dive"):
+        suggested = snp_df.sort_values('quantile_score', ascending=False)['biosample_name'].unique().tolist()[:5] if not snp_df.empty else []
+        sel_portal_tissues = st.multiselect("Select Tissues", biosamples, default=safe_defaults(suggested, biosamples))
+        if st.button("🧬 Send to Molecular Deep Dive", key="portal_btn"):
             st.session_state['sel_var_portal'] = lookup_vid; st.session_state['sel_tissues_portal'] = sel_portal_tissues
-            st.success(f"Configured for {lookup_vid}. Scroll down.")
+            st.success("Synchronized!")
 
 st.divider(); st.subheader("2. Micro-View: Molecular Deep Dive")
 if HAS_AG:
@@ -275,27 +297,20 @@ if HAS_AG:
     portal_tissues = st.session_state.get('sel_tissues_portal', [])
     target_vars = sorted(filtered_df['variant_id'].unique().tolist())
     if portal_vid and portal_vid not in target_vars: target_vars.insert(0, portal_vid)
-    if not target_vars: st.warning("No variants selected.")
-    else:
+    if target_vars:
         with st.expander("⚙️ Configure & Generate Tracks", expanded=True):
-            # Vertical Stack for better usability
             selected_idx = target_vars.index(portal_vid) if portal_vid in target_vars else 0
             sel_var = st.selectbox("1. Select Variant for Analysis", target_vars, index=selected_idx, format_func=format_variant_label)
-            
             var_context = get_variant_context(selected_file, sel_var)
             defaults = portal_tissues if sel_var == portal_vid and portal_tissues else (var_context.sort_values('quantile_score', ascending=False)['biosample_name'].head(3).tolist() if not var_context.empty else [])
-            sel_names = st.multiselect("2. Select Tissues to Plot (Limit 50)", biosamples, default=safe_defaults(defaults, biosamples))
-            
+            sel_names = st.multiselect("2. Select Tissues (Max 50)", biosamples, default=safe_defaults(defaults, biosamples))
             c_opt, c_key, c_btn = st.columns([1, 2, 1])
-            with c_opt:
-                sync_y = st.checkbox("Sync Y-Axes", value=True, help="Use same scale for REF and ALT to show relative effect magnitude.")
-            with c_key:
-                api_key = st.text_input("AlphaGenome API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
+            with c_opt: sync_y = st.checkbox("Sync Y-Axes", value=True)
+            with c_key: api_key = st.text_input("AlphaGenome API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
             with c_btn:
-                st.write("") # spacer
-                btn_label = "🧬 Generate Tracks"
-                if st.button(btn_label, type="primary", width='stretch', disabled=not (api_key and sel_names)):
-                    with st.spinner("Querying AlphaGenome..."):
+                st.write(""); 
+                if st.button("🧬 Generate Tracks", type="primary", width='stretch', disabled=not (api_key and sel_names)):
+                    with st.spinner("Querying API..."):
                         try:
                             sel_curies = [global_curie_map[n] for n in sel_names if n in global_curie_map]
                             client = dna_client.create(api_key=api_key)
@@ -303,24 +318,17 @@ if HAS_AG:
                             chrom_n = f"chr{chrom}" if not str(chrom).startswith('chr') else str(chrom)
                             var_obj = genome.Variant(chromosome=chrom_n, position=pos, reference_bases=ref, alternate_bases=alt, name=sel_var)
                             interval = var_obj.reference_interval.resize(131072)
-                            request_splice = False
-                            if not var_context.empty:
-                                splice_scores = var_context[var_context['output_type'] == 'SPLICE_JUNCTIONS']
-                                if not splice_scores.empty and splice_scores['quantile_score'].abs().max() > 0.5: request_splice = True
-                            req_outputs = [dna_output.OutputType.RNA_SEQ, dna_output.OutputType.ATAC]
-                            if request_splice: req_outputs.append(dna_output.OutputType.SPLICE_JUNCTIONS)
-                            res = client.predict_variant(interval=interval, variant=var_obj, requested_outputs=req_outputs, ontology_terms=sel_curies, organism=dna_client.Organism.HOMO_SAPIENS)
-                            components = []
-                            if res.reference.rna_seq and res.alternate.rna_seq: components.append(plot_components.OverlaidTracks({'REF': res.reference.rna_seq, 'ALT': res.alternate.rna_seq}, ylabel_template='RNA-Seq\n(Expr)', alpha=0.6, shared_y_scale=sync_y))
-                            if res.reference.atac and res.alternate.atac: components.append(plot_components.OverlaidTracks({'REF': res.reference.atac, 'ALT': res.alternate.atac}, ylabel_template='ATAC-Seq\n(Access)', alpha=0.6, shared_y_scale=sync_y))
+                            request_splice = not var_context.empty and not var_context[var_context['output_type'] == 'SPLICE_JUNCTIONS'].empty
+                            req = [dna_output.OutputType.RNA_SEQ, dna_output.OutputType.ATAC]
+                            if request_splice: req.append(dna_output.OutputType.SPLICE_JUNCTIONS)
+                            res = client.predict_variant(interval=interval, variant=var_obj, requested_outputs=req, ontology_terms=sel_curies, organism=dna_client.Organism.HOMO_SAPIENS)
+                            comp = []
+                            if res.reference.rna_seq: comp.append(plot_components.OverlaidTracks({'REF': res.reference.rna_seq, 'ALT': res.alternate.rna_seq}, ylabel_template='RNA-Seq', alpha=0.6, shared_y_scale=sync_y))
+                            if res.reference.atac: comp.append(plot_components.OverlaidTracks({'REF': res.reference.atac, 'ALT': res.alternate.atac}, ylabel_template='ATAC-Seq', alpha=0.6, shared_y_scale=sync_y))
                             if request_splice and res.reference.splice_junctions:
-                                components.append(plot_components.Sashimi(res.reference.splice_junctions, ylabel_template='Splice(REF)'))
-                                components.append(plot_components.Sashimi(res.alternate.splice_junctions, ylabel_template='Splice(ALT)'))
-                            if components:
-                                st.session_state['fig_out'] = plot_components.plot(components, interval, annotations=[plot_components.VariantAnnotation([var_obj], labels=[f"{ref}>{alt}"])], fig_width=18, hspace=0.4, despine=True, xlabel='Genomic Position (GRCh38)', title=f"Ref vs Alt Signal: {format_variant_label(sel_var)}")
-                                st.success("Tracks generated!")
-                            else: st.warning("No signal tracks returned.")
+                                comp.append(plot_components.Sashimi(res.reference.splice_junctions, ylabel_template='Splice(REF)'))
+                                comp.append(plot_components.Sashimi(res.alternate.splice_junctions, ylabel_template='Splice(ALT)'))
+                            if comp: st.session_state['fig_out'] = plot_components.plot(comp, interval, annotations=[plot_components.VariantAnnotation([var_obj], labels=[f"{ref}>{alt}"])], fig_width=18, hspace=0.4, despine=True, xlabel='Genomic Position (GRCh38)', title=f"Signal: {format_variant_label(sel_var)}")
                         except Exception as e: st.error(f"API Error: {e}")
         if 'fig_out' in st.session_state: st.pyplot(st.session_state['fig_out'])
-        else: st.info("Configure controls above and click 'Generate Tracks'.")
 else: st.warning("AlphaGenome not installed.")
