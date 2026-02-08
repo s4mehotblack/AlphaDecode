@@ -430,13 +430,16 @@ if HAS_AG:
                             res = client.predict_variant(interval=interval, variant=var_obj, requested_outputs=req, ontology_terms=sel_curies, organism=dna_client.Organism.HOMO_SAPIENS)
                             
                             comp = []
-                            # ROBUST LABELING
+                            # ROBUST LABELING with Unique Identifiers
                             def get_safe_label(track, fallback_title):
                                 if not has_data(track): return fallback_title
                                 m = track.metadata
                                 parts = []
                                 if 'biosample_name' in m.columns: parts.append(str(m['biosample_name'].iloc[0]))
                                 if 'biosample_type' in m.columns: parts.append(f"({m['biosample_type'].iloc[0]})")
+                                # Differentiate duplicate tracks using Donor or Name (Accession)
+                                if 'donor_id' in m.columns: parts.append(f"[{m['donor_id'].iloc[0]}]")
+                                elif 'name' in m.columns: parts.append(f"[{m['name'].iloc[0]}]")
                                 label = " ".join(parts)
                                 return f"{label}\n{fallback_title}"
 
@@ -452,7 +455,7 @@ if HAS_AG:
                                         diff_track = alt_track - ref_track
                                         comp.append(plot_components.Tracks(
                                             diff_track, ylabel_template='Difference\n(ALT - REF)', 
-                                            filled=True, track_colors='red' # FIX: Use track_colors instead of color in kwargs
+                                            filled=True, track_colors='red'
                                         ))
 
                             add_signal_group(res.reference.rna_seq, res.alternate.rna_seq, "RNA-Seq")
@@ -462,6 +465,13 @@ if HAS_AG:
                                 comp.append(plot_components.Sashimi(res.reference.splice_junctions, ylabel_template='{name}\nSplice(REF)'))
                                 comp.append(plot_components.Sashimi(res.alternate.splice_junctions, ylabel_template='{name}\nSplice(ALT)'))
                             
+                            # Add Gene Annotations if available
+                            try:
+                                # We try to initialize a generic GeneAnnotation. 
+                                # If a local genome DB isn't found, it may fail, so we wrap in try/except.
+                                comp.append(plot_components.GeneAnnotation(ylabel_template='Genes'))
+                            except Exception: pass
+
                             if comp:
                                 st.session_state['fig_out'] = plot_components.plot(
                                     comp, interval, 
