@@ -52,7 +52,14 @@ def get_unique_values_lazy(file_path, column_name):
                 return sorted([str(x) for x in vals if x is not None])
             return []
         except Exception: pass
-    return []
+    try:
+        header = pd.read_csv(file_path, nrows=0)
+        if column_name not in header.columns: return []
+        vals = set()
+        for chunk in pd.read_csv(file_path, usecols=[column_name], chunksize=100000):
+            vals.update(chunk[column_name].dropna().unique())
+        return sorted([str(x) for x in vals])
+    except Exception: return []
 
 @st.cache_data
 def get_global_curie_map(file_path):
@@ -71,11 +78,8 @@ def get_global_curie_map(file_path):
 def get_variant_context(file_path, variant_id):
     if HAS_POLARS:
         try:
-            cols = ['variant_id', 'biosample_name', 'output_type', 'quantile_score', 'ontology_curie']
             q = pl.scan_csv(file_path).filter(pl.col('variant_id') == variant_id)
-            schema = q.collect_schema().names()
-            existing_cols = [c for c in cols if c in schema]
-            return q.select(existing_cols).collect(engine="streaming").to_pandas()
+            return q.collect(engine="streaming").to_pandas()
         except Exception: return pd.DataFrame()
     return pd.DataFrame()
 
@@ -108,6 +112,24 @@ def get_snps_with_meta_lazy(file_path, chrom):
     return pd.DataFrame(columns=['variant_id', 'max_impact'])
 
 @st.cache_data
+def get_snps_by_chrom_lazy(file_path, chrom):
+    """Fetches unique variant IDs for a specific chromosome."""
+    if HAS_POLARS:
+        try:
+            lf = pl.scan_csv(file_path)
+            schema = lf.collect_schema().names()
+            if "variant_id" in schema:
+                if "CHROM" in schema:
+                    q = lf.filter(pl.col("CHROM").astype(pl.Utf8) == str(chrom)).select("variant_id").unique()
+                else:
+                    q = lf.filter(pl.col("variant_id").str.starts_with(f"{chrom}:") | 
+                                  pl.col("variant_id").str.starts_with(f"chr{chrom}:")).select("variant_id").unique()
+                vals = q.collect(engine="streaming").to_series().to_list()
+                return sorted([str(x) for x in vals if x is not None])
+        except Exception: pass
+    return []
+
+@st.cache_data
 def load_heatmap_data(file_path, locus_id, score_thresh, genes=None, biosamples=None, assays=None):
     if HAS_POLARS:
         try:
@@ -124,19 +146,54 @@ def load_heatmap_data(file_path, locus_id, score_thresh, genes=None, biosamples=
     return pd.DataFrame()
 
 @st.cache_data
-def load_top_hits(file_path, locus_id, score_thresh):
+def load_mechanism_data(file_path, locus_id, assay_x, assay_y, genes=None, biosamples=None):
+    if HAS_POLARS:
+        try:
+            q = pl.scan_csv(file_path)
+            schema = q.collect_schema().names()
+            if locus_id != 'All' and "Locus_ID" in schema: q = q.filter(pl.col('Locus_ID') == locus_id)
+            if genes and "gene_name" in schema: q = q.filter(pl.col('gene_name').is_in(genes))
+            if biosamples and "biosample_name" in schema: q = q.filter(pl.col('biosample_name').is_in(biosamples))
+            q = q.filter(pl.col('output_type').is_in([assay_x, assay_y]))
+            q = q.group_by(['variant_id', 'biosample_name', 'output_type']).agg(pl.col('quantile_score').mean())
+            df = q.collect(engine="streaming").to_pandas()
+            if not df.empty:
+                return df.pivot_table(index=['variant_id', 'biosample_name'], columns='output_type', values='quantile_score').reset_index()
+        except Exception as e: st.error(f"Mechanism pivot failed: {e}")
+    return pd.DataFrame()
+
+@st.cache_data
+def load_top_hits(file_path, locus_id, score_thresh, genes=None, biosamples=None, assays=None):
     if HAS_POLARS:
         try:
             q = pl.scan_csv(file_path)
             schema = q.collect_schema().names()
             cols = ['variant_id', 'biosample_name', 'output_type', 'quantile_score']
             if "Locus_ID" in schema and locus_id != 'All': q = q.filter(pl.col('Locus_ID') == locus_id)
+            if genes and "gene_name" in schema: q = q.filter(pl.col('gene_name').is_in(genes))
+            if biosamples and "biosample_name" in schema: q = q.filter(pl.col('biosample_name').is_in(biosamples))
+            if assays and "output_type" in schema: q = q.filter(pl.col('output_type').is_in(assays))
+            
             existing = [c for c in cols if c in schema]
             q = q.select(existing)
-            if "quantile_score" in schema:
-                q = q.filter(pl.col('quantile_score').abs() >= score_thresh)
+            if "quantile_score" in schema: q = q.filter(pl.col('quantile_score').abs() >= score_thresh)
             return q.collect(engine="streaming").to_pandas()
         except Exception: pass
+    return pd.DataFrame()
+
+@st.cache_data
+def load_filtered_subset(file_path, locus_id, score_thresh, genes=None, biosamples=None, assays=None, ignore_thresh_for_assays=False):
+    if HAS_POLARS:
+        try:
+            q = pl.scan_csv(file_path)
+            schema = q.collect_schema().names()
+            if locus_id != 'All' and "Locus_ID" in schema: q = q.filter(pl.col('Locus_ID') == locus_id)
+            if not ignore_thresh_for_assays and score_thresh > 0 and "quantile_score" in schema: q = q.filter(pl.col('quantile_score').abs() >= score_thresh)
+            if genes and "gene_name" in schema: q = q.filter(pl.col('gene_name').is_in(genes))
+            if biosamples and "biosample_name" in schema: q = q.filter(pl.col('biosample_name').is_in(biosamples))
+            if assays and "output_type" in schema: q = q.filter(pl.col('output_type').is_in(assays))
+            return q.collect(engine="streaming").to_pandas()
+        except Exception: return pd.DataFrame()
     return pd.DataFrame()
 
 def parse_variant_id(vid):
@@ -173,14 +230,10 @@ def assign_biological_system(biosample_name):
     return "Other"
 
 def format_pval(log10p, threshold=7.3, has_leads=True):
-    """Converts LOG10P to scientific notation or sub-significant label."""
     try:
         if pd.isna(log10p):
-            if has_leads:
-                # Variant exists in results but not in leads cache -> it was below threshold
-                return f"< {10**(-threshold):.0e}"
-            else:
-                return "N/A"
+            if has_leads: return f"< {10**(-threshold):.0e}"
+            else: return "N/A"
         lp = float(log10p)
         if lp < 0: return "N/A"
         return f"{10**(-lp):.2e}"
@@ -210,11 +263,9 @@ with st.sidebar:
         if not all_chroms: all_chroms = [str(i) for i in range(1, 23)] + ['X', 'Y']
         global_curie_map = get_global_curie_map(selected_file)
         leads_df = get_locus_leads_map(selected_file)
-    
     selected_locus = st.selectbox("Locus ID", ['All'] + locus_ids, index=min(1, len(locus_ids)))
     score_threshold = st.slider("Min. Functional Score (Abs)", 0.0, 1.0, 0.5, 0.05)
-    leads_threshold = st.slider("Leads Sig. Threshold (LOG10P)", 5.0, 10.0, 7.3, 0.1, help="The threshold used during 'analyze_decodeme.py' to define Lead SNPs.")
-    
+    leads_threshold = st.slider("Leads Sig. Threshold (LOG10P)", 5.0, 10.0, 7.3, 0.1)
     st.header("Refine View")
     sel_genes = st.multiselect("Filter by Genes", gene_names)
     sel_biosamples = st.multiselect("Filter by Tissues", biosamples)
@@ -224,8 +275,14 @@ with st.sidebar:
     unique_pos = st.checkbox("Unique Genomic Positions Only", value=True)
     sort_by = st.selectbox("Sort Candidates By", ["Functional Impact", "GWAS P-value"])
 
+with st.spinner(f"Filtering records..."):
+    filtered_df = load_filtered_subset(selected_file, selected_locus, score_threshold, genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
+
+# --- Actionable Intelligence Hub ---
+# Optimized Load: Only fetch top hits metadata
 with st.spinner("Analyzing Top Candidates..."):
-    top_hits = load_top_hits(selected_file, selected_locus, score_threshold)
+    top_hits = load_top_hits(selected_file, selected_locus, score_threshold, 
+                             genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
 
 if not top_hits.empty and selected_locus != 'All':
     st.markdown("### 📍 Locus Context & Candidate Selection")
@@ -266,38 +323,67 @@ if not top_hits.empty and selected_locus != 'All':
     display_df = enriched.head(20).copy()
     display_df.loc[:, 'GWAS P'] = display_df['LOG10P'].apply(lambda x: format_pval(x, leads_threshold, has_leads_data))
     display_df.loc[:, 'Variant'] = display_df['variant_id'].apply(format_variant_label)
-    cols_f = ['Variant', 'GWAS P', 'biosample_name', 'output_type', 'quantile_score']
-    selection = st.dataframe(display_df[[c for c in cols_f if c in display_df.columns]], width='stretch', hide_index=True, on_select="rerun", selection_mode="single-row")
+    
+    cols_final = ['Variant', 'GWAS P', 'biosample_name', 'output_type', 'quantile_score']
+    cols_exist = [c for c in cols_final if c in display_df.columns]
+    
+    selection = st.dataframe(display_df[cols_exist], width='stretch', hide_index=True, on_select="rerun", selection_mode="single-row")
     if selection.selection.rows:
-        st.session_state['sel_var_portal'] = enriched.iloc[selection.selection.rows[0]]['variant_id']
-        st.toast(f"Synchronized with {st.session_state['sel_var_portal']}")
+        sel_vid = enriched.iloc[selection.selection.rows[0]]['variant_id']
+        sel_tissue = enriched.iloc[selection.selection.rows[0]]['biosample_name']
+        st.session_state['sel_var_portal'] = sel_vid
+        st.session_state['sel_tissues_portal'] = [sel_tissue]
+        st.toast(f"Synchronized with {sel_vid}")
     st.divider()
 
+# --- Module 1: Macro-Visualization ---
 st.subheader("1. Macro-View: Functional Landscape")
 tab1, tab2, tab3 = st.tabs(["🔥 Functional Fingerprint", "🔗 Mechanism", "🔎 Quick Lookup"])
 
 with tab1:
     h_thresh = st.slider("Heatmap Score Threshold", 0.0, 1.0, score_threshold, 0.05, key="h_t")
-    with st.spinner("Aggregating heatmap..."):
-        heatmap_data = load_heatmap_data(selected_file, selected_locus, h_thresh, genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
+    # Optimized Load: Aggregated Heatmap Data Only
+    with st.spinner(" aggregating heatmap..."):
+        heatmap_data = load_heatmap_data(selected_file, selected_locus, h_thresh, 
+                                         genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
+    
     if not heatmap_data.empty:
-        heatmap_data = heatmap_data.copy()
         heatmap_data.loc[:, 'System'] = heatmap_data['biosample_name'].apply(assign_biological_system)
         available_systems = sorted(heatmap_data['System'].unique())
         c1, c2 = st.columns([2, 1])
         selected_system = c1.selectbox("System", available_systems)
         orient = c2.radio("Axis", ["Variant focus", "Tissue focus"], horizontal=True)
+        
         sys_df = heatmap_data[heatmap_data['System'] == selected_system].copy()
-        plot_data = sys_df.groupby(['variant_id', 'biosample_name'])['quantile_score'].mean().reset_index()
-        plot_data.loc[:, 'display_id'] = plot_data['variant_id'].apply(lambda x: x.split(':')[-1])
-        x_c, y_c = ("biosample_name", "display_id") if orient == "Variant focus" else ("display_id", "biosample_name")
-        fig = px.density_heatmap(plot_data, x=x_c, y=y_c, z="quantile_score", color_continuous_scale="RdBu_r", range_color=[-1, 1], title=f"Impact: {selected_system}")
-        fig.update_layout(height=max(400, min(1200, len(plot_data[y_c].unique()) * 25)))
+        heatmap_plot_data = sys_df.groupby(['variant_id', 'biosample_name'])['quantile_score'].mean().reset_index()
+        heatmap_plot_data.loc[:, 'display_id'] = heatmap_plot_data['variant_id'].apply(lambda x: x.split(':')[-1])
+        
+        x_col, y_col = ("biosample_name", "display_id") if orient == "Variant focus" else ("display_id", "biosample_name")
+        fig = px.density_heatmap(heatmap_plot_data, x=x_col, y=y_col, z="quantile_score", color_continuous_scale="RdBu_r", range_color=[-1, 1], title=f"Impact: {selected_system}")
+        fig.update_layout(height=max(400, min(1200, len(heatmap_plot_data[y_col].unique()) * 25)))
         st.plotly_chart(fig, width="stretch")
-    else: st.info("No data passing filters.")
+    else: st.info("No data passing filters for Heatmap.")
 
 with tab2:
-    st.info("Correlations require sub-threshold data. Tab pending optimization.")
+    st.markdown("### Cross-Assay Correlation")
+    if len(output_types) < 2:
+        st.warning("Only one assay type available in this file.")
+    else:
+        c1, c2 = st.columns(2)
+        x_assay = c1.selectbox("X-Axis Assay", output_types, index=0)
+        y_assay = c2.selectbox("Y-Axis Assay", output_types, index=min(1, len(output_types)-1))
+        
+        with st.spinner("Pivoting data..."):
+            pivot_df = load_mechanism_data(selected_file, selected_locus, x_assay, y_assay, genes=sel_genes, biosamples=sel_biosamples)
+        
+        if not pivot_df.empty:
+            pivot_df = pivot_df.dropna(subset=[x_assay, y_assay])
+            if not pivot_df.empty:
+                fig = px.scatter(pivot_df, x=x_assay, y=y_assay, color="biosample_name", hover_data=['variant_id'], title=f"{x_assay} vs {y_assay}")
+                fig.add_hline(y=0, line_dash="dash", line_color="grey"); fig.add_vline(x=0, line_dash="dash", line_color="grey")
+                st.plotly_chart(fig, width="stretch")
+            else: st.warning("No overlapping variants found between these assays.")
+        else: st.info("No data found for selected assays.")
 
 with tab3:
     st.markdown("### 🔎 Quick Lookup Portal")
@@ -311,7 +397,7 @@ with tab3:
             if not snp_meta.empty:
                 snp_labels = [f"{row['variant_id'].split(':')[-1]} (Impact: {row['max_impact']:.2f})" for _, row in snp_meta.iterrows()]
                 label_to_id = dict(zip(snp_labels, snp_meta['variant_id']))
-                sel_label = st.selectbox("Search SNPs", snp_labels)
+                sel_label = st.selectbox("Search SNPs (Sorted by Impact)", snp_labels)
                 lookup_vid = label_to_id.get(sel_label)
             else: lookup_vid = None
     if lookup_vid:
@@ -327,17 +413,33 @@ st.divider(); st.subheader("2. Micro-View: Molecular Deep Dive")
 if HAS_AG:
     portal_vid = st.session_state.get('sel_var_portal')
     portal_tissues = st.session_state.get('sel_tissues_portal', [])
+    
+    # Safely determine variants list for Deep Dive
     target_vars = []
-    if portal_vid: target_vars.append(portal_vid)
+    if not filtered_df.empty:
+        target_vars = sorted(filtered_df['variant_id'].unique().tolist())
+    
+    if portal_vid and portal_vid not in target_vars:
+        target_vars.insert(0, portal_vid)
+    
     if target_vars:
         with st.expander("⚙️ Configure & Generate Tracks", expanded=True):
-            sel_var = st.selectbox("Variant", target_vars, index=0, format_func=format_variant_label)
+            selected_idx = target_vars.index(portal_vid) if portal_vid in target_vars else 0
+            sel_var = st.selectbox("1. Select Variant for Analysis", target_vars, index=selected_idx, format_func=format_variant_label)
+            
             var_context = get_variant_context(selected_file, sel_var)
-            defaults = portal_tissues if sel_var == portal_vid and portal_tissues else (var_context.sort_values('quantile_score', ascending=False)['biosample_name'].head(3).tolist() if not var_context.empty else [])
-            sel_names = st.multiselect("Tissues (Max 50)", biosamples, default=safe_defaults(defaults, biosamples))
+            tissue_mode = st.radio("Tissue Selection:", ["Synced from Table", "Top 5 Global Hits"], horizontal=True)
+            
+            if tissue_mode == "Synced from Table" and sel_var == portal_vid and portal_tissues:
+                defaults = portal_tissues
+            else:
+                defaults = var_context.sort_values('quantile_score', ascending=False)['biosample_name'].head(5).tolist() if not var_context.empty else []
+            
+            sel_names = st.multiselect("2. Select Tissues to Plot (Limit 50)", biosamples, default=safe_defaults(defaults, biosamples))
+            
             c_opt, c_key, c_btn = st.columns([1, 2, 1])
             with c_opt: sync_y = st.checkbox("Sync Y-Axes", value=True)
-            with c_key: api_key = st.text_input("AlphaGenome API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
+            with c_key: api_key = st.text_input("API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
             with c_btn:
                 st.write(""); 
                 if st.button("🧬 Generate Tracks", type="primary", width='stretch', disabled=not (api_key and sel_names)):
@@ -349,13 +451,15 @@ if HAS_AG:
                             chrom_n = f"chr{chrom}" if not str(chrom).startswith('chr') else str(chrom)
                             var_obj = genome.Variant(chromosome=chrom_n, position=pos, reference_bases=ref, alternate_bases=alt, name=sel_var)
                             interval = var_obj.reference_interval.resize(131072)
+                            
+                            def has_data(tdata): return tdata is not None and getattr(tdata, 'values', np.array([])).size > 0
                             request_splice = not var_context.empty and not var_context[var_context['output_type'] == 'SPLICE_JUNCTIONS'].empty
                             req = [dna_output.OutputType.RNA_SEQ, dna_output.OutputType.ATAC]
                             if request_splice: req.append(dna_output.OutputType.SPLICE_JUNCTIONS)
                             res = client.predict_variant(interval=interval, variant=var_obj, requested_outputs=req, ontology_terms=sel_curies, organism=dna_client.Organism.HOMO_SAPIENS)
                             comp = []
-                            if res.reference.rna_seq: comp.append(plot_components.OverlaidTracks({'REF': res.reference.rna_seq, 'ALT': res.alternate.rna_seq}, ylabel_template='RNA-Seq', alpha=0.6, shared_y_scale=sync_y))
-                            if res.reference.atac: comp.append(plot_components.OverlaidTracks({'REF': res.reference.atac, 'ALT': res.alternate.atac}, ylabel_template='ATAC-Seq', alpha=0.6, shared_y_scale=sync_y))
+                            if has_data(res.reference.rna_seq): comp.append(plot_components.OverlaidTracks({'REF': res.reference.rna_seq, 'ALT': res.alternate.rna_seq}, ylabel_template='RNA-Seq\n(Expr)', alpha=0.6, shared_y_scale=sync_y))
+                            if has_data(res.reference.atac): comp.append(plot_components.OverlaidTracks({'REF': res.reference.atac, 'ALT': res.alternate.atac}, ylabel_template='ATAC-Seq\n(Access)', alpha=0.6, shared_y_scale=sync_y))
                             if request_splice and res.reference.splice_junctions:
                                 comp.append(plot_components.Sashimi(res.reference.splice_junctions, ylabel_template='Splice(REF)'))
                                 comp.append(plot_components.Sashimi(res.alternate.splice_junctions, ylabel_template='Splice(ALT)'))
