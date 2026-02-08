@@ -9,6 +9,7 @@ import hashlib
 import matplotlib.pyplot as plt
 from io import StringIO
 from pathlib import Path
+import copy
 
 # Try importing Polars for performance
 try:
@@ -78,7 +79,7 @@ def get_global_curie_map(file_path):
 def get_variant_context(file_path, variant_id):
     if HAS_POLARS:
         try:
-            q = pl.scan_csv(file_path).filter(pl.col('variant_id').str.to_lowercase() == variant_id.lower())
+            q = pl.scan_csv(file_path).filter(pl.col('variant_id') == variant_id)
             return q.collect(engine="streaming").to_pandas()
         except Exception: return pd.DataFrame()
     return pd.DataFrame()
@@ -283,11 +284,7 @@ with st.spinner(f"Filtering records..."):
     filtered_df = load_filtered_subset(selected_file, selected_locus, score_threshold, genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
 
 # --- Actionable Intelligence Hub ---
-with st.spinner("Analyzing Top Candidates..."):
-    top_hits = load_top_hits(selected_file, selected_locus, score_threshold, 
-                             genes=sel_genes, biosamples=sel_biosamples, assays=sel_assays)
-
-if not top_hits.empty and selected_locus != 'All':
+if not filtered_df.empty and selected_locus != 'All':
     st.markdown("### 📍 Locus Context & Candidate Selection")
     lead_p, lead_id = "N/A", "N/A"
     has_leads_data = not leads_df.empty and 'ID' in leads_df.columns
@@ -297,32 +294,37 @@ if not top_hits.empty and selected_locus != 'All':
         if not locus_gwas.empty:
             lead_p, lead_id = format_pval(locus_gwas['LOG10P'].iloc[0], leads_threshold, True), locus_gwas['ID'].iloc[0]
 
-    top_row = top_hits.loc[top_hits['quantile_score'].abs().idxmax()]
+    top_row = filtered_df.loc[filtered_df['quantile_score'].abs().idxmax()]
     c_stat, c_func = st.columns(2)
     with c_stat: st.info(f"**Statistical Context (GWAS)**\n\n**Lead SNP:** {lead_id}\n\n**P-value:** {lead_p}")
     with c_func: st.success(f"**Functional Evidence (AlphaGenome)**\n\n**Top Variant:** {top_row['variant_id'].split(':')[-1]}\n\n**Max Impact:** {top_row['quantile_score']:.2f} ({top_row['biosample_name']})")
 
     st.markdown("**Interactive Candidate Table:** Select a row to sync with the Deep Dive.")
-    working_hits = top_hits.copy()
-    if has_leads_data:
-        working_hits.loc[:, 'join_key'] = working_hits['variant_id'].apply(normalize_id_for_join)
+    
+    # Corrected top hits logic: Top per variant, not just top 15 rows
+    agg_hits = filtered_df.copy()
+    agg_hits['abs_q'] = agg_hits['quantile_score'].abs()
+    top_vids = agg_hits.groupby('variant_id')['abs_q'].max().sort_values(ascending=False).head(30).index
+    top_hits = agg_hits[agg_hits['variant_id'].isin(top_vids)].sort_values(['variant_id', 'abs_q'], ascending=[True, False]).groupby('variant_id').head(1).copy()
+    
+    if not leads_df.empty:
+        top_hits['join_key'] = top_hits['variant_id'].apply(normalize_id_for_join)
         leads_copy = leads_df[['ID', 'LOG10P']].copy()
-        leads_copy.loc[:, 'join_key'] = leads_copy['ID'].apply(normalize_id_for_join)
+        leads_copy['join_key'] = leads_copy['ID'].apply(normalize_id_for_join)
         leads_copy = leads_copy.drop_duplicates('join_key')
-        enriched = pd.merge(working_hits, leads_copy[['join_key', 'LOG10P']], on='join_key', how='left')
-    else: enriched = working_hits; enriched['LOG10P'] = np.nan
+        enriched = pd.merge(top_hits, leads_copy[['join_key', 'LOG10P']], on='join_key', how='left')
+    else: enriched = top_hits; enriched['LOG10P'] = np.nan
 
     if unique_pos:
         enriched.loc[:, 'genpos'] = enriched['variant_id'].apply(lambda x: parse_variant_id(x)[1])
-        enriched.loc[:, 'abs_quantile'] = enriched['quantile_score'].abs()
-        idx = enriched.groupby('genpos')['abs_quantile'].idxmax()
-        enriched = enriched.loc[idx].drop(columns=['abs_quantile', 'genpos'])
+        idx = enriched.groupby('genpos')['abs_q'].idxmax()
+        enriched = enriched.loc[idx].drop(columns=['abs_q', 'genpos'])
     
     if sort_by == "GWAS P-value": enriched = enriched.sort_values('LOG10P', ascending=False)
     else: enriched = enriched.sort_values('quantile_score', key=abs, ascending=False)
 
     display_df = enriched.head(20).copy()
-    display_df.loc[:, 'GWAS P'] = display_df['LOG10P'].apply(lambda x: format_pval(x, leads_threshold, has_leads_data))
+    display_df.loc[:, 'GWAS P'] = display_df['LOG10P'].apply(lambda x: format_pval(x, leads_threshold, not leads_df.empty))
     display_df.loc[:, 'Variant'] = display_df['variant_id'].apply(format_variant_label)
     cols_f = ['Variant', 'GWAS P', 'biosample_name', 'output_type', 'quantile_score']
     selection = st.dataframe(display_df[[c for c in cols_f if c in display_df.columns]], width='stretch', hide_index=True, on_select="rerun", selection_mode="single-row")
@@ -351,6 +353,7 @@ with tab1:
         orient = c2.radio("Axis", ["Variant focus", "Tissue focus"], horizontal=True)
         sys_df = heatmap_data[heatmap_data['System'] == selected_system].copy()
         plot_data = sys_df.groupby(['variant_id', 'biosample_name'])['quantile_score'].mean().reset_index()
+        # Improved Heatmap Labels: Position (Swap)
         plot_data.loc[:, 'display_id'] = plot_data['variant_id'].apply(format_heatmap_label)
         x_c, y_c = ("biosample_name", "display_id") if orient == "Variant focus" else ("display_id", "biosample_name")
         fig = px.density_heatmap(plot_data, x=x_c, y=y_c, z="quantile_score", color_continuous_scale="RdBu_r", range_color=[-1, 1], 
@@ -371,6 +374,7 @@ with tab3:
         else:
             with st.spinner("Indexing SNPs..."): snp_meta = get_snps_with_meta_lazy(selected_file, selected_chrom)
             if not snp_meta.empty:
+                # Improved Search Labels: Full address + Impact
                 snp_labels = [f"{format_variant_label(row['variant_id'])} | Impact: {row['max_impact']:.2f}" for _, row in snp_meta.iterrows()]
                 label_to_id = dict(zip(snp_labels, snp_meta['variant_id']))
                 sel_label = st.selectbox("Search SNPs", snp_labels)
@@ -391,6 +395,7 @@ if HAS_AG:
     portal_tissues = st.session_state.get('sel_tissues_portal', [])
     target_vars = []
     if portal_vid: target_vars.append(portal_vid)
+    
     if target_vars:
         with st.expander("⚙️ Configure & Generate Tracks", expanded=True):
             sel_var = st.selectbox("Variant", target_vars, index=0, format_func=format_variant_label)
@@ -399,9 +404,11 @@ if HAS_AG:
             if tissue_mode == "Synced from Table" and sel_var == portal_vid and portal_tissues: defaults = portal_tissues
             else: defaults = var_context.sort_values('quantile_score', ascending=False)['biosample_name'].head(5).tolist() if not var_context.empty else []
             sel_names = st.multiselect("Tissues (Max 50)", biosamples, default=safe_defaults(defaults, biosamples))
-            c_opt, c_key, c_btn = st.columns([1, 2, 1])
-            with c_opt: sync_y = st.checkbox("Sync Y-Axes", value=True)
-            with c_key: api_key = st.text_input("API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
+            
+            c_opt1, c_opt2, c_key, c_btn = st.columns([1, 1, 2, 1])
+            with c_opt1: sync_y = st.checkbox("Sync Y-Axes", value=True)
+            with c_opt2: show_diff = st.checkbox("Show Difference Tracks", value=True)
+            with c_key: api_key = st.text_input("AlphaGenome API Key", value=os.environ.get("ALPHAGENOME_API_KEY", ""), type="password")
             with c_btn:
                 st.write(""); 
                 if st.button("🧬 Generate Tracks", type="primary", width='stretch', disabled=not (api_key and sel_names)):
@@ -413,19 +420,66 @@ if HAS_AG:
                             chrom_n = f"chr{chrom}" if not str(chrom).startswith('chr') else str(chrom)
                             var_obj = genome.Variant(chromosome=chrom_n, position=pos, reference_bases=ref, alternate_bases=alt, name=sel_var)
                             interval = var_obj.reference_interval.resize(131072)
+                            
                             def has_data(tdata): return tdata is not None and getattr(tdata, 'values', np.array([])).size > 0
+                            
                             request_splice = not var_context.empty and not var_context[var_context['output_type'] == 'SPLICE_JUNCTIONS'].empty
                             req = [dna_output.OutputType.RNA_SEQ, dna_output.OutputType.ATAC]
                             if request_splice: req.append(dna_output.OutputType.SPLICE_JUNCTIONS)
+                            
                             res = client.predict_variant(interval=interval, variant=var_obj, requested_outputs=req, ontology_terms=sel_curies, organism=dna_client.Organism.HOMO_SAPIENS)
+                            
                             comp = []
-                            if has_data(res.reference.rna_seq): comp.append(plot_components.OverlaidTracks({'REF': res.reference.rna_seq, 'ALT': res.alternate.rna_seq}, ylabel_template='{biosample_name}\nRNA-Seq', alpha=0.6, shared_y_scale=sync_y))
-                            if has_data(res.reference.atac): comp.append(plot_components.OverlaidTracks({'REF': res.reference.atac, 'ALT': res.alternate.atac}, ylabel_template='{biosample_name}\nATAC-Seq', alpha=0.6, shared_y_scale=sync_y))
+                            # ROBUST LABELING
+                            def get_safe_label(track, fallback_title):
+                                if not has_data(track): return fallback_title
+                                m = track.metadata
+                                parts = []
+                                if 'biosample_name' in m.columns: parts.append(str(m['biosample_name'].iloc[0]))
+                                if 'biosample_type' in m.columns: parts.append(f"({m['biosample_type'].iloc[0]})")
+                                label = " ".join(parts)
+                                return f"{label}\n{fallback_title}"
+
+                            def add_signal_group(ref_track, alt_track, assay_name):
+                                if has_data(ref_track) and has_data(alt_track):
+                                    comp.append(plot_components.OverlaidTracks(
+                                        {'REF': ref_track, 'ALT': alt_track}, 
+                                        ylabel_template=get_safe_label(ref_track, assay_name), 
+                                        alpha=0.6, shared_y_scale=sync_y
+                                    ))
+                                    if show_diff:
+                                        # Calculation delta safely via overloaded subtraction
+                                        diff_track = alt_track - ref_track
+                                        comp.append(plot_components.Tracks(
+                                            diff_track, ylabel_template='Difference\n(ALT - REF)', 
+                                            filled=True, track_colors='red' # FIX: Use track_colors instead of color in kwargs
+                                        ))
+
+                            add_signal_group(res.reference.rna_seq, res.alternate.rna_seq, "RNA-Seq")
+                            add_signal_group(res.reference.atac, res.alternate.atac, "ATAC-Seq")
+                            
                             if request_splice and res.reference.splice_junctions:
                                 comp.append(plot_components.Sashimi(res.reference.splice_junctions, ylabel_template='{name}\nSplice(REF)'))
                                 comp.append(plot_components.Sashimi(res.alternate.splice_junctions, ylabel_template='{name}\nSplice(ALT)'))
-                            if comp: st.session_state['fig_out'] = plot_components.plot(comp, interval, annotations=[plot_components.VariantAnnotation([var_obj], labels=[f"{ref}>{alt} site"])], fig_width=18, hspace=0.4, despine=True, xlabel='Genomic Position (GRCh38)', title=f"Molecular Proof: {format_variant_label(sel_var)}")
+                            
+                            if comp:
+                                st.session_state['fig_out'] = plot_components.plot(
+                                    comp, interval, 
+                                    annotations=[plot_components.VariantAnnotation([var_obj], labels=[f"{ref}>{alt} site"])], 
+                                    fig_width=18, hspace=0.4, despine=True, xlabel='Genomic Position (GRCh38)', 
+                                    title=f"Molecular Proof: {format_variant_label(sel_var)}"
+                                )
+                                # Store metadata for expansion
+                                all_meta = []
+                                if res.reference.rna_seq: all_meta.append(res.reference.rna_seq.metadata)
+                                if res.reference.atac: all_meta.append(res.reference.atac.metadata)
+                                if all_meta: st.session_state['track_meta'] = pd.concat(all_meta).drop_duplicates()
                         except Exception as e: st.error(f"API Error: {e}")
-        if 'fig_out' in st.session_state: st.pyplot(st.session_state['fig_out'])
+        
+        if 'fig_out' in st.session_state: 
+            st.pyplot(st.session_state['fig_out'])
+            if 'track_meta' in st.session_state:
+                with st.expander("🔍 Inspection: Track Metadata"):
+                    st.dataframe(st.session_state['track_meta'], width='stretch')
     else: st.info("Use the Candidate Table or Quick Lookup to select a variant for Deep Dive.")
 else: st.warning("AlphaGenome not installed.")

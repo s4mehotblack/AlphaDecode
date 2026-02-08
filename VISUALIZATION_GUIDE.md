@@ -28,6 +28,7 @@ The tool will open in your browser at `http://localhost:8501`.
 *   **Score Threshold:** Filters variants by their **absolute functional impact** (Quantile Score).
     *   *Default (0.5):* Shows moderate-to-high impact variants.
     *   *High (0.9):* Shows only the strongest "driver" candidates.
+*   **Leads Sig. Threshold:** Adjusts the threshold (e.g. 7.3) used to label sub-significant variants in the candidate table.
 
 ### 2. Actionable Intelligence Hub (Top Panel)
 This section answers the question: *"Is the statistical lead also the functional lead?"*
@@ -35,35 +36,35 @@ This section answers the question: *"Is the statistical lead also the functional
 *   **Split-Screen Metrics:**
     *   **Left (GWAS):** Displays the P-value of the statistically strongest SNP in the locus.
     *   **Right (Functional):** Displays the AlphaGenome score of the biologically strongest SNP.
-    *   *Insight:* If these IDs differ, the causal variant may be a functional proxy, not the GWAS lead.
-*   **Interactive Candidate Table:** Lists the top 15 functional candidates.
-    *   **GWAS P:** Shows the P-value for each candidate (joined from your leads cache).
-    *   **Sync Action:** **Clicking any row** instantly synchronizes the entire dashboard (Deep Dive & Quick Lookup) to that specific variant and tissue.
+*   **Interactive Candidate Table:** Lists the top functional candidates.
+    *   **Filtering Logic:** To ensure diversity, the table identifies the top 30 **distinct variants** first, then displays the single most impactful tissue for each. This prevents one "super-variant" from dominating the entire list.
+    *   **GWAS P:** Shows the P-value for each candidate. Sub-significant credible variants are labeled as `< 5e-08` (or your chosen threshold).
+    *   **Sync Action:** **Clicking any row** instantly synchronizes the entire dashboard. The "Micro-View" will pre-load that exact **Variant** and **Tissue**.
 
 ### 3. Macro-View: Functional Landscape
 Visualize patterns across the entire locus.
 
 *   **🔥 Functional Fingerprint (Heatmap):**
-    *   **System Grouping:** Tissues are automatically grouped by biological system (CNS, Immune, Metabolic) to reduce clutter.
-    *   **Diverging Scale:**
-        *   🔴 **Red:** Gain of Function (Increased expression/accessibility).
-        *   🔵 **Blue:** Loss of Function (Decreased expression/accessibility).
-    *   **Axis Toggle:** Switch between "Variant Focus" (comparing one SNP across tissues) and "Tissue Focus" (comparing many SNPs in one tissue).
+    *   **Labels:** Axes display the **Genomic Position** and **Allele Swap** (e.g., `48,916,462 (A>G)`) for clear identification.
+    *   **System Grouping:** Tissues are grouped by biological system (CNS, Immune, Metabolic).
+    *   **Diverging Scale:** Red (Gain) vs. Blue (Loss).
 *   **🔗 Mechanism (Scatter Plot):**
-    *   Correlates scores between two assays (e.g., RNA-Seq vs. ATAC-Seq) to propose mechanisms.
-    *   *Example:* A variant in the top-right quadrant increases chromatin accessibility (ATAC) AND gene expression (RNA), suggesting an enhancer gain-of-function.
+    *   Correlates scores between two assays (e.g., RNA-Seq vs. ATAC-Seq) to propose mechanisms (e.g. enhancer-driven expression).
 
 ### 4. Micro-View: Molecular Deep Dive
 The "Microscope" for proving causality.
 
 *   **Configuration:**
-    *   **Variant:** Pre-filled from your selection in the table/heatmap.
-    *   **Tissue Selection:** Choose specific tissues to visualize. Defaults to the tissue you clicked on ("Synced") but can be toggled to show the "Top 5 Global Hits".
-    *   **Sync Y-Axes:** When checked (default), forces Reference and Alternate tracks to share the same Y-axis scale, visually emphasizing the *magnitude* of the change.
+    *   **Tissue Selection Mode:**
+        *   **"Synced from Table" (Default):** Focuses on the specific tissue you clicked in the candidate table.
+        *   **"Top 5 Global Hits":** Automatically loads the 5 highest-scoring tissues for that variant, regardless of the macro-view.
+    *   **Show Difference Tracks:** When checked, plots a **Delta Track** (`ALT - REF`) below the overlaid signals. Red filled areas indicate increased signal; Blue indicate decreased signal.
 *   **Generated Tracks:**
-    *   **Signal Tracks:** Overlays the predicted signal for Reference (Blue) vs. Alternate (Orange) alleles.
-    *   **Splicing Arcs (Sashimi):** Automatically appears if the variant is predicted to disrupt splicing (`Score > 0.5`).
+    *   **Rich Labels:** Y-axes display unambiguous context: `{Tissue Name} ({Type}) | {Assay}` (e.g., *Tibial Nerve (tissue) | RNA-Seq*).
+    *   **Signal Tracks:** Overlays Reference (Blue) vs. Alternate (Orange) signals.
     *   **Variant Annotation:** A vertical line explicitly marks the mutation site (e.g., `A > G site`).
+    *   **Splicing Arcs:** Automatically appear if the variant has a high `SPLICE_JUNCTIONS` impact score.
+*   **Metadata Inspection:** An expander below the plot reveals the full metadata table (Donor ID, Age, Sex, etc.) for the visualized tracks.
 
 ---
 
@@ -71,34 +72,30 @@ The "Microscope" for proving causality.
 
 ### 1. Memory vs. Speed (The Polars Decision)
 *   **Design:** The tool uses **Polars LazyFrames** and **Streaming** execution.
-*   **Reason:** The raw results file can exceed 1.2GB. Loading this into Pandas on a standard laptop causes Out-of-Memory (OOM) crashes.
+*   **Reason:** The raw results file can exceed 1.2GB. Loading this into Pandas causes Out-of-Memory (OOM) crashes on standard machines.
 *   **Impact:** The app scans the file on disk and only loads the tiny fraction of rows needed for the current view.
 
 ### 2. The "Credible Set" Disconnect
-*   **Observation:** You may see `N/A` in the "GWAS P" column for some strong functional candidates.
-*   **Reason:** The "Leads" cache only stores genome-wide significant hits ($P < 5 	imes 10^{-8}$). However, the "Credible Set" includes sub-significant variants ($P \approx 10^{-5}$) if they are in high LD with a lead.
-*   **Decision:** We label these as `< 5e-08` or `N/A` rather than hiding them, as they are often biologically critical despite lower statistical significance.
+*   **Observation:** You may see `N/A` or `< 5e-08` in the "GWAS P" column for strong functional candidates.
+*   **Reason:** The "Leads" cache only stores genome-wide significant hits ($P < 5 \times 10^{-8}$). However, fine-mapping Credible Sets include sub-significant variants if they are in high LD with a lead.
+*   **Decision:** We label these clearly rather than hiding them, as they are often biologically critical "functional proxies."
 
-### 3. Automated Splicing Detection
-*   **Design:** Sashimi plots are not shown by default.
-*   **Reason:** Splicing tracks are visually complex.
-*   **Logic:** The app checks the `SPLICE_JUNCTIONS` score for the selected variant. Only if it exceeds `0.5` (predicting a splice defect) does it request the splicing data from the API.
+### 3. Difference Track Calculation
+*   **Method:** The "Difference" track is calculated mathematically as `Alternate_Value - Reference_Value` at every base pair.
+*   **Visualization:** It uses a filled plot with a diverging colormap centered at zero. This provides an instant visual readout of the *magnitude* and *direction* of the variant's effect, which can be subtle in overlaid plots.
 
 ---
 
 ## ❓ FAQ & Troubleshooting
 
-**Q: Why do I see "No data passing filters" in the Heatmap?**
-**A:** Your `Score Threshold` might be too high. Try lowering it to `0.1`. Alternatively, you may have selected a filter (e.g., "Gene: IL2RA") that doesn't exist in the selected Locus.
+**Q: Why is only one tissue shown in the Deep Dive when I click the table?**
+**A:** Because you are in **"Synced from Table"** mode. The tool assumes you want to investigate the specific finding you clicked on. To see more tissues, switch the radio button to **"Top 5 Global Hits"** or manually add them in the dropdown.
 
-**Q: Why are the GWAS P-values "N/A" in the top table?**
-**A:** This usually means the variant is a "functional proxy" that did not reach genome-wide significance in the GWAS but was included in the analysis because it is linked to a Lead SNP.
+**Q: Why did the API return an error about 'assay_title'?**
+**A:** We use robust fallback logic now. If a specific metadata field is missing from the AlphaGenome response, the label will degrade gracefully to a simpler format (e.g., just the output type) rather than crashing.
 
-**Q: Why is my specific tissue missing from the "Deep Dive" list?**
-**A:** The list defaults to the top 3-5 tissues where the variant has the *highest impact*. To see a specific tissue, select it manually from the "Select Tissues" dropdown or click its cell in the Heatmap to "Sync" it.
-
-**Q: Why did the app crash with `StreamlitAPIException`?**
-**A:** This was a known issue with list synchronization (fixed in v2.0). It occurred when a "Default" tissue selected in one view didn't exist in the filtered context of another view. The current version uses a `safe_defaults` validator to prevent this.
+**Q: Why don't I see splicing arcs?**
+**A:** Splicing tracks are visually complex. The app checks the `SPLICE_JUNCTIONS` score for the selected variant. Only if it exceeds `0.5` (predicting a splice defect) does it request and plot the splicing data.
 
 **Q: Can I analyze a variant that isn't in my file?**
-**A:** Yes! Go to the **"🔎 Quick Lookup"** tab, check **"Manual Entry"**, and type any variant ID (e.g., `chr6:12345:A:T`). You can then send this "theoretical" variant to the Deep Dive to get real-time AlphaGenome predictions.
+**A:** Yes! Go to the **"🔎 Quick Lookup"** tab, check **"Manual Entry"**, and type any variant ID. You can then send this "theoretical" variant to the Deep Dive to get real-time AlphaGenome predictions.
