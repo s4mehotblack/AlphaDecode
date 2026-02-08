@@ -44,15 +44,28 @@ COMMON_TISSUES = {
 # --- Helper Functions ---
 
 def parse_variant_string(var_str):
-    """Parses 'chr:pos:ref:alt' string."""
+    """Parses 'chr:pos:ref:alt' or 'chrom:pos_ref/alt' string."""
+    var_str = var_str.strip()
     try:
-        parts = var_str.strip().split(':')
-        if len(parts) == 4:
+        # Format 1: chr1:73126414:C:CA
+        if ':' in var_str and var_str.count(':') == 3:
+            parts = var_str.split(':')
             chrom = parts[0].replace('chr', '')
             pos = int(parts[1])
             ref = parts[2].upper()
             alt = parts[3].upper()
             return chrom, pos, ref, alt
+        
+        # Format 2: 1:73126414_C/CA
+        if ':' in var_str and '_' in var_str and '/' in var_str:
+            chrom_part, rest = var_str.split(':', 1)
+            pos_part, alleles_part = rest.split('_', 1)
+            ref, alt = alleles_part.split('/', 1)
+            
+            chrom = chrom_part.replace('chr', '')
+            pos = int(pos_part)
+            return chrom, pos, ref.upper(), alt.upper()
+            
     except Exception:
         pass
     return None, None, None, None
@@ -94,7 +107,7 @@ with st.sidebar:
         with col_r: sel_ref = st.text_input("Ref Allele", "A")
         with col_a: sel_alt = st.text_input("Alt Allele", "G")
     else:
-        var_str = st.text_input("Variant String", placeholder="chr1:12345:A:G")
+        var_str = st.text_input("Variant String", placeholder="chr1:12345:A:G or 1:12345_A/G")
         if var_str:
             c, p, r, a = parse_variant_string(var_str)
             if c:
