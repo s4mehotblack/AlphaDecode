@@ -1,6 +1,10 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+
+# Increase Pandas Styler limit for large prediction tables
+pd.set_option("styler.render.max_elements", 1000000)
+
 import matplotlib.pyplot as plt
 import os
 import io
@@ -277,7 +281,13 @@ if st.button("🚀 Fetch Predictions", type="primary"):
 
         with tab_scores:
             if not scores_df.empty:
-                st.dataframe(scores_df.style.background_gradient(cmap="RdBu_r", subset=['score']), use_container_width=True)
+                # Determine which score column to highlight
+                target_col = 'quantile_score' if 'quantile_score' in scores_df.columns else ('raw_score' if 'raw_score' in scores_df.columns else None)
+                if target_col:
+                    st.dataframe(scores_df.style.background_gradient(cmap="RdBu_r", subset=[target_col]), width="stretch")
+                else:
+                    st.dataframe(scores_df, width="stretch")
+                
                 csv = scores_df.to_csv(index=False)
                 st.download_button("Download Scores CSV", csv, "alphagenome_scores.csv", "text/csv")
             else:
@@ -290,7 +300,7 @@ if st.button("🚀 Fetch Predictions", type="primary"):
             
             if meta_dfs:
                 full_meta = pd.concat(meta_dfs, ignore_index=True)
-                st.dataframe(full_meta, use_container_width=True)
+                st.dataframe(full_meta, width="stretch")
             else:
                 st.info("No metadata available.")
 
