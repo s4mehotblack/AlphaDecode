@@ -281,12 +281,18 @@ if st.button("🚀 Fetch Predictions", type="primary"):
 
         with tab_scores:
             if not scores_df.empty:
+                # Convert object columns to strings to ensure Arrow compatibility
+                # (e.g. variant_id may contain Variant objects)
+                scores_df_display = scores_df.copy()
+                for col in scores_df_display.select_dtypes(include=['object']).columns:
+                    scores_df_display[col] = scores_df_display[col].astype(str)
+
                 # Determine which score column to highlight
-                target_col = 'quantile_score' if 'quantile_score' in scores_df.columns else ('raw_score' if 'raw_score' in scores_df.columns else None)
+                target_col = 'quantile_score' if 'quantile_score' in scores_df_display.columns else ('raw_score' if 'raw_score' in scores_df_display.columns else None)
                 if target_col:
-                    st.dataframe(scores_df.style.background_gradient(cmap="RdBu_r", subset=[target_col]), width="stretch")
+                    st.dataframe(scores_df_display.style.background_gradient(cmap="RdBu_r", subset=[target_col]), width="stretch")
                 else:
-                    st.dataframe(scores_df, width="stretch")
+                    st.dataframe(scores_df_display, width="stretch")
                 
                 csv = scores_df.to_csv(index=False)
                 st.download_button("Download Scores CSV", csv, "alphagenome_scores.csv", "text/csv")
@@ -300,12 +306,15 @@ if st.button("🚀 Fetch Predictions", type="primary"):
             
             if meta_dfs:
                 full_meta = pd.concat(meta_dfs, ignore_index=True)
+                # Convert object columns to strings for Arrow compatibility
+                for col in full_meta.select_dtypes(include=['object']).columns:
+                    full_meta[col] = full_meta[col].astype(str)
                 st.dataframe(full_meta, width="stretch")
             else:
                 st.info("No metadata available.")
 
         with tab_json:
-            st.json(str(prediction_res))
+            st.text(str(prediction_res))
 
     except Exception as e:
         status.update(label="Error Occurred", state="error")
